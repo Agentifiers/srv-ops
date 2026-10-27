@@ -158,13 +158,13 @@ new job gets the new image. Recycle idle runners after a rebuild with
 ## srv
 
 Run upstream srv (`SRV_SRC_DIR` in `site.env`; https://github.com/HeavyHorst/srv)
-with project templates that keep an empty `/etc/machine-id`; a missing one
-makes every clone run systemd's first-boot presets and stall on
-`systemd-networkd-wait-online`. When upgrading srv:
+plus the local patches in `../host/srv/patches/` (see the top-level README).
+When upgrading srv:
 
 1. Disable the pools and remove the idle runners.
 2. Back up `/var/lib/srv/state`, `/etc/srv` and `/srv/jail/.start-receipts`.
-3. Run `sudo ./contrib/systemd/install.sh`, then restart `srv-net-helper`,
-   `srv-vm-runner` and `srv`.
+3. Update `SRV_SRC_DIR` to the new upstream revision, run
+   `../host/srv/apply-patches.sh`, then `sudo ./contrib/systemd/install.sh` in
+   `SRV_SRC_DIR`, and restart `srv-net-helper`, `srv-vm-runner` and `srv`.
 4. Rebuild and install `srv-orb-dispatch` (see `../srv-orbs`), then re-enable
    the pools.
