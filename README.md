@@ -76,4 +76,4 @@ Where they live on the host (never in this repo):
 ## License
 
 MIT (see `LICENSE`); a few vendored or derived files keep their own licenses,
-listed there.
+listed in `NOTICE.md`.

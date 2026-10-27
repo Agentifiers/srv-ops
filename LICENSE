@@ -19,12 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-Some files carry their own licenses, which take precedence for those files:
-
-- srv-orbs/agents/skills/pstack/: MIT, Lauren Tan (see its LICENSE).
-- srv-orbs/mobile/kernel/patches/0001-staging-android-ashmem.patch: GPL-2.0
-  (Linux/Android ashmem driver; headers GPL-2.0 OR Apache-2.0).
-- Patches under srv-orbs/mobile/expo-ios/patches/ and overlays/ modify Expo
-  and React Native (MIT) and are offered under the same license as the code
-  they modify.
