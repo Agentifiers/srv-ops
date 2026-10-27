@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+"""iphone: drive the shared, USB-attached iPhone through the host's iphone-broker.
+
+The broker (IPHONE_BROKER_URL, set by the orb image) identifies this orb by its tailnet
+node; one orb holds the phone at a time (the lease). Device commands acquire the
+lease when it is free and renew it while they run; release it when you are done
+(`iphone lease release`), otherwise it lapses after the broker's idle timeout (10 minutes
+by default) without a command.
+
+Exit codes: 0 ok, 1 error, 2 usage, 3 the phone is leased by another orb, 4 phone unavailable.
+"""
+import argparse
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
+
+BASE = os.environ.get("IPHONE_BROKER_URL", "").rstrip("/")
+AUTO_LEASE = os.environ.get("IPHONE_AUTO_LEASE", "1") != "0"
+
+
+class Fail(Exception):
+    def __init__(self, msg, code=1):
+        super().__init__(msg)
+        self.code = code
+
+
+def request(method, path, body=None, *, data=None, length=None, ctype=None, timeout=120, stream=False):
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    elif ctype:
+        headers["Content-Type"] = ctype
+    if length is not None:
+        headers["Content-Length"] = str(length)
+    if not BASE:
+        raise Fail("IPHONE_BROKER_URL is not set (the orb image sets it in /etc/profile.d/mobile-iphone-client.sh)")
+    req = urllib.request.Request(BASE + path, data=data, method=method, headers=headers)
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            err = json.loads(raw)
+        except ValueError:
+            err = {"error": raw.decode(errors="replace") or e.reason}
+        err["status"] = e.code
+        return e.code, err, None
+    except (urllib.error.URLError, OSError) as e:
+        raise Fail(f"cannot reach the iPhone broker at {BASE}: {getattr(e, 'reason', e)}", 4)
+    if stream:
+        return resp.status, None, resp
+    raw = resp.read()
+    if resp.headers.get_content_type() == "application/json":
+        return resp.status, json.loads(raw), resp
+    return resp.status, raw, resp
+
+
+def check(status, body):
+    if status < 400:
+        return body
+    msg = body.get("error", body) if isinstance(body, dict) else body
+    if status == 409 and isinstance(body, dict) and body.get("holder"):
+        raise Fail(f"iphone: {msg}", 3)
+    if status in (401, 403):
+        raise Fail(f"iphone: not allowed: {msg}")
+    if status == 503:
+        raise Fail(f"iphone: {msg}", 4)
+    raise Fail(f"iphone: {msg} (HTTP {status})")
+
+
+class Renewer:
+    """Keeps the lease alive while a long command (upload, stream) runs."""
+
+    def __init__(self, every=120):
+        self.every, self.stop = every, threading.Event()
+        self.t = threading.Thread(target=self.run, daemon=True)
+
+    def run(self):
+        while not self.stop.wait(self.every):
+            try:
+                request("POST", "/v1/lease/renew", {}, timeout=30)
+            except Fail:
+                pass
+
+    def __enter__(self):
+        self.t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+
+
+def leased(method, path, body=None, **kw):
+    """A lease-gated call: acquire the lease if it is free, then retry once."""
+    data = kw.get("data")
+    with Renewer():
+        status, out, resp = request(method, path, body, **kw)
+        if status == 409 and isinstance(out, dict) and out.get("holder") is None and AUTO_LEASE:
+            st, o, _ = request("POST", "/v1/lease", {})
+            check(st, o)
+            print(f"iphone: lease acquired by {o['lease']['holder']} (release with `iphone lease release`)", file=sys.stderr)
+            if hasattr(data, "seek"):
+                data.seek(0)
+            status, out, resp = request(method, path, body, **kw)
+        check(status, out)
+        return out, resp
+
+
+def jprint(obj):
+    print(json.dumps(obj, indent=2, sort_keys=False))
+
+
+def ago(ts):
+    return f"{round(time.time() - ts)}s ago" if ts else "-"
+
+
+# ---------------------------------------------------------------------- commands
+def c_status(a):
+    st, out, _ = request("GET", "/v1/status")
+    out = check(st, out)
+    if a.json:
+        return jprint(out)
+    lease, phone = out["lease"], out["phone"]
+    if lease["holder"]:
+        print(f"lease:   held by {lease['holder']} for {round((time.time() - lease['since']) / 60)} min, "
+              f"last command {ago(lease['last_activity'])}, auto-release in {lease['expires_in']}s")
+    else:
+        print("lease:   free")
+    if phone["connected"]:
+        bat = phone.get("battery") or {}
+        print(f"phone:   {phone.get('model')} ({phone.get('product_type')}), iOS {phone.get('ios')} ({phone.get('build')}), "
+              f"connected; battery {bat.get('percent')}%{' charging' if bat.get('charging') else ''}; "
+              f"DDI {'mounted' if phone.get('ddi_mounted') else 'NOT mounted'}; screen {phone['screen']['state']}")
+    else:
+        print("phone:   NOT connected")
+    for f in out["forwards"]:
+        print(f"forward: {f['host']}:{f['port']} -> {'device:' + str(f['device_port']) if f['kind'] == 'device' else 'live view'}")
+    if out.get("xcuitest"):
+        print(f"xcuitest: {out['xcuitest']['runner_bundle_id']} {out['xcuitest']['state']}")
+    print(f"signing: {'available' if out['signing']['available'] else 'not configured'} (bundle ids under {', '.join(out['signing']['bundle_prefixes'])})")
+
+
+def c_whoami(a):
+    st, out, _ = request("GET", "/v1/whoami")
+    jprint(check(st, out))
+
+
+def c_lease(a):
+    if a.action == "status":
+        return c_status(a)
+    if a.action == "acquire":
+        st, out, _ = request("POST", "/v1/lease", {})
+        out = check(st, out)
+        print(f"lease held by {out['lease']['holder']} (auto-release after {out['lease']['idle_timeout']}s without a command)")
+    elif a.action == "renew":
+        st, out, _ = request("POST", "/v1/lease/renew", {})
+        out = check(st, out)
+        print(f"lease renewed; auto-release in {out['lease']['expires_in']}s")
+    elif a.action == "release":
+        st, out, _ = request("DELETE", "/v1/lease" + ("?force=1" if a.force else ""))
+        out = check(st, out)
+        print("lease released" if out["released"] else "lease was not held")
+
+
+def c_info(a):
+    out, _ = leased("GET", "/v1/device/info")
+    jprint(out)
+
+
+def c_screenshot(a):
+    q = {}
+    if a.scale != 1:
+        q["scale"] = a.scale
+    if a.jpeg:
+        q["format"] = "jpeg"
+    path = "/v1/device/screenshot" + ("?" + urllib.parse.urlencode(q) if q else "")
+    out, _ = leased("GET", path, timeout=60)
+    dest = Path(a.output or f"iphone-{time.strftime('%Y%m%d-%H%M%S')}.{'jpg' if a.jpeg else 'png'}")
+    dest.write_bytes(out)
+    print(dest)
+
+
+def c_wake(a):
+    out, _ = leased("POST", "/v1/device/wake", {})
+    print(f"screen was {out['screen_before']}, now {out['screen']['state']}")
+
+
+def c_apps(a):
+    out, _ = leased("GET", "/v1/apps" + ("?all=1" if a.all else ""))
+    if a.json:
+        return jprint(out)
+    for x in out:
+        mark = " (broker-installed)" if x["installed_by_broker"] else ""
+        print(f"{x['bundle_id']:50} {x.get('version') or '':10} {x.get('name') or ''}{mark}")
+
+
+def c_install(a):
+    p = Path(a.ipa)
+    if not p.is_file():
+        raise Fail(f"no such file: {p}", 2)
+    with p.open("rb") as f:
+        out, _ = leased("POST", "/v1/apps/install", data=f, length=p.stat().st_size,
+                        ctype="application/octet-stream", timeout=1800)
+    print(f"installed {out['installed']}")
+
+
+def c_uninstall(a):
+    out, _ = leased("DELETE", "/v1/apps/" + urllib.parse.quote(a.bundle_id))
+    print(f"uninstalled {out['uninstalled']}")
+
+
+def stream_out(resp):
+    while chunk := resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536):
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+
+
+def c_launch(a):
+    body = {"args": a.arg, "env": dict(kv.split("=", 1) for kv in a.env), "kill_existing": not a.no_kill}
+    if a.url:
+        body["url"] = a.url
+    if a.console:
+        body["console_seconds"] = a.console
+        _, resp = leased("POST", f"/v1/apps/{urllib.parse.quote(a.bundle_id)}/launch", body,
+                         timeout=a.console + 120, stream=True)
+        return stream_out(resp)
+    out, _ = leased("POST", f"/v1/apps/{urllib.parse.quote(a.bundle_id)}/launch", body)
+    print(f"launched {out['bundle_id']} pid {out['pid']}" + (f" with {out['url']}" if out.get("url") else ""))
+
+
+def c_terminate(a):
+    out, _ = leased("POST", f"/v1/apps/{urllib.parse.quote(a.bundle_id)}/terminate", {})
+    print(f"terminated {out['terminated']} (pid {out['pid']})" if out.get("was_running") else f"{out['terminated']} was not running")
+
+
+def c_open_url(a):
+    body = {"url": a.url}
+    if a.bundle:
+        body["bundle_id"] = a.bundle
+    out, _ = leased("POST", "/v1/device/open-url", body)
+    print(f"opened {a.url} in {out['bundle_id']} (pid {out['pid']})")
+
+
+def c_syslog(a):
+    q = {"seconds": a.seconds, "process": a.process}
+    if a.match:
+        q["match"] = a.match
+    if a.json:
+        q["format"] = "json"
+    _, resp = leased("GET", "/v1/device/syslog?" + urllib.parse.urlencode(q), timeout=a.seconds + 60, stream=True)
+    stream_out(resp)
+
+
+def unit(a):
+    return "pt" if a.pt else "norm" if a.norm else "px"
+
+
+def c_tap(a):
+    leased("POST", "/v1/hid/tap", {"x": a.x, "y": a.y, "unit": unit(a)})
+
+
+def c_swipe(a):
+    leased("POST", "/v1/hid/swipe", {"x1": a.x1, "y1": a.y1, "x2": a.x2, "y2": a.y2, "duration": a.duration, "unit": unit(a)})
+
+
+def c_crashes(a):
+    out, _ = leased("GET", "/v1/device/crashes?" + urllib.parse.urlencode({"process": a.process, "limit": a.limit}),
+                    timeout=300)
+    if not out:
+        return print(f"no crash reports for {a.process}")
+    d = Path(a.dir)
+    d.mkdir(parents=True, exist_ok=True)
+    for r in out:
+        (d / r["name"]).write_text(r["content"])
+        print(d / r["name"])
+
+
+def c_type(a):
+    text = a.text.replace("\\n", "\n").replace("\\t", "\t")
+    leased("POST", "/v1/hid/type", {"text": text}, timeout=max(120, len(text)))
+
+
+def c_key(a):
+    leased("POST", "/v1/hid/key", {"key": a.name, "count": a.count})
+
+
+def c_button(a):
+    leased("POST", "/v1/hid/button", {"name": a.name})
+
+
+def c_location(a):
+    if a.action == "clear":
+        leased("DELETE", "/v1/device/location")
+        print("location simulation cleared")
+    else:
+        if a.lat is None or a.lon is None:
+            raise Fail("usage: iphone location set LAT LON", 2)
+        leased("POST", "/v1/device/location", {"lat": a.lat, "lon": a.lon})
+        print(f"simulating {a.lat},{a.lon} (until `iphone location clear` or lease release)")
+
+
+def c_forward(a):
+    if a.list:
+        st, out, _ = request("GET", "/v1/forward")
+        return jprint(check(st, out))
+    if a.close:
+        leased("DELETE", f"/v1/forward/{a.device_port}")
+        return print(f"closed forward for device port {a.device_port}")
+    out, _ = leased("POST", "/v1/forward", {"device_port": a.device_port})
+    print(f"{out['host']}:{out['port']}")
+
+
+def c_xcuitest(a):
+    if a.action == "start":
+        body = {"runner_bundle_id": a.runner, "env": dict(kv.split("=", 1) for kv in a.env)}
+        if a.target:
+            body["target_bundle_id"] = a.target
+        out, _ = leased("POST", "/v1/xcuitest", body)
+        print(f"xcuitest {out['runner_bundle_id']} {out['state']}")
+    elif a.action == "stop":
+        out, _ = leased("DELETE", "/v1/xcuitest")
+        print("\n".join(out["log"][-20:]))
+        print(f"xcuitest stopped ({out['state']}, rc {out['returncode']})")
+    else:
+        since = 0
+        while True:
+            out, _ = leased("GET", f"/v1/xcuitest?since={since}")
+            for ln in out["log"]:
+                print(ln, flush=True)
+            since = out["log_seq"]
+            if not a.follow or out["state"] != "running":
+                print(f"[{out['state']}{'' if out['returncode'] is None else ', rc ' + str(out['returncode'])}]", file=sys.stderr)
+                return
+            time.sleep(1)
+
+
+def c_live(a):
+    if a.stop:
+        leased("DELETE", "/v1/live")
+        return print("live view stopped")
+    out, _ = leased("POST", "/v1/live", {}, timeout=60)
+    print(f"{out['url']}  (user: anything, password: {out['password']}) — {out.get('note', '')}")
+
+
+def c_sign(a):
+    src = Path(a.path)
+    with tempfile.TemporaryDirectory() as tmp:
+        if src.is_dir():
+            if src.suffix != ".app":
+                raise Fail(f"{src}: expected an .app directory, a zip of one, or an .ipa", 2)
+            z = Path(tmp) / "app.zip"
+            with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+                for p in sorted(src.rglob("*")):
+                    arc = (Path(src.name) / p.relative_to(src)).as_posix()
+                    if p.is_symlink():
+                        zi = zipfile.ZipInfo(arc)
+                        zi.create_system = 3
+                        zi.external_attr = 0o120777 << 16
+                        zf.writestr(zi, os.readlink(p))
+                    elif p.is_file():
+                        zf.write(p, arc)
+            src = z
+        elif not src.is_file():
+            raise Fail(f"no such file: {src}", 2)
+        with src.open("rb") as f:
+            out, resp = leased("POST", "/v1/sign", data=f, length=src.stat().st_size,
+                               ctype="application/zip", timeout=1800)
+    dest = Path(a.output)
+    dest.write_bytes(out)
+    info = json.loads(resp.headers.get("X-Signed", "{}"))
+    ids = ", ".join(b["bundle_id"] for b in info.get("bundle_ids", []))
+    print(f"signed {dest} ({ids}; team {info.get('team')})")
+
+
+def c_processes(a):
+    out, _ = leased("GET", "/v1/device/processes")
+    if a.json:
+        return jprint(out)
+    for p in out:
+        print(f"{p['pid']:>7} {p['name']}")
+
+
+def c_kill(a):
+    leased("POST", f"/v1/device/processes/{a.pid}/kill", {})
+    print(f"killed {a.pid}")
+
+
+def c_api(a):
+    data = length = None
+    body = json.loads(a.data) if a.data else None
+    if a.file:
+        data = open(a.file, "rb")
+        length = os.path.getsize(a.file)
+    out, resp = leased(a.method.upper(), a.path, body, data=data, length=length,
+                       ctype="application/octet-stream" if a.file else None, stream=True, timeout=1800)
+    stream_out(resp)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="iphone", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    def cmd(name, fn, help):
+        p = sub.add_parser(name, help=help, description=help)
+        p.set_defaults(fn=fn)
+        return p
+
+    def coords(p):
+        g = p.add_mutually_exclusive_group()
+        g.add_argument("--pt", action="store_true", help="coordinates in points (screenshot pixels / 3)")
+        g.add_argument("--norm", action="store_true", help="coordinates normalized 0..65535")
+
+    p = cmd("status", c_status, "lease holder and phone state")
+    p.add_argument("--json", action="store_true")
+    cmd("whoami", c_whoami, "how the broker sees this node")
+    p = cmd("lease", c_lease, "acquire | renew | release | status the exclusive lease")
+    p.add_argument("action", choices=["acquire", "renew", "release", "status"])
+    p.add_argument("--force", action="store_true", help="release: admin only, someone else's lease")
+    p.add_argument("--json", action="store_true")
+    cmd("info", c_info, "device info (model, iOS, display size)")
+    p = cmd("screenshot", c_screenshot, "save a screenshot (default ./iphone-<time>.png), prints the path")
+    p.add_argument("-o", "--output")
+    p.add_argument("--scale", type=float, default=1.0, help="0.05..1 (full size: 1179x2556 px)")
+    p.add_argument("--jpeg", action="store_true")
+    cmd("wake", c_wake, "if the screen is off: press home twice (wake + unlock, no passcode)")
+    p = cmd("apps", c_apps, "installed user apps (--all: system apps too)")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p = cmd("install", c_install, "install a signed .ipa (see `iphone sign`)")
+    p.add_argument("ipa")
+    p = cmd("uninstall", c_uninstall, "uninstall an app installed through the broker")
+    p.add_argument("bundle_id")
+    p = cmd("launch", c_launch, "launch an app (kills a running instance unless --no-kill)")
+    p.add_argument("bundle_id")
+    p.add_argument("--arg", action="append", default=[], help="launch argument (repeatable)")
+    p.add_argument("--env", action="append", default=[], help="KEY=VALUE (repeatable)")
+    p.add_argument("--url", help="deliver this URL to the app at launch (deep link)")
+    p.add_argument("--no-kill", action="store_true")
+    p.add_argument("--console", type=float, metavar="SECONDS", help="stream the app's stdout/stderr this long")
+    p = cmd("terminate", c_terminate, "kill an app by bundle id")
+    p.add_argument("bundle_id")
+    p = cmd("open-url", c_open_url, "open a URL / deep link (http(s) in Safari, else in --bundle)")
+    p.add_argument("url")
+    p.add_argument("--bundle", help="the app that handles the URL, e.g. your dev client")
+    p = cmd("syslog", c_syslog, "stream a process' device log for --seconds")
+    p.add_argument("process", help="executable name, e.g. the app's CFBundleExecutable")
+    p.add_argument("--seconds", type=float, default=30)
+    p.add_argument("--match", help="only lines containing this")
+    p.add_argument("--json", action="store_true")
+    p = cmd("crashes", c_crashes, "save the newest crash reports of a broker-installed app's process")
+    p.add_argument("process", help="executable name (CFBundleExecutable)")
+    p.add_argument("--limit", type=int, default=3)
+    p.add_argument("--dir", default="iphone-crashes")
+    p = cmd("tap", c_tap, "tap at X Y (screenshot pixels by default)")
+    p.add_argument("x", type=float)
+    p.add_argument("y", type=float)
+    coords(p)
+    p = cmd("swipe", c_swipe, "swipe/drag from X1 Y1 to X2 Y2 (finger contact)")
+    for n in ("x1", "y1", "x2", "y2"):
+        p.add_argument(n, type=float)
+    p.add_argument("--duration", type=float, default=0.3)
+    coords(p)
+    p = cmd("type", c_type, "type text into the focused field (\\n = Return)")
+    p.add_argument("text")
+    p = cmd("key", c_key, "press a key: backspace enter escape tab left right up down")
+    p.add_argument("name")
+    p.add_argument("--count", type=int, default=1)
+    p = cmd("button", c_button, "press a hardware button: home lock volume-up volume-down mute siri")
+    p.add_argument("name", choices=["home", "lock", "volume-up", "volume-down", "mute", "siri"])
+    p = cmd("location", c_location, "simulate GPS: set LAT LON | clear")
+    p.add_argument("action", choices=["set", "clear"])
+    p.add_argument("lat", type=float, nargs="?")
+    p.add_argument("lon", type=float, nargs="?")
+    p = cmd("forward", c_forward, "expose a device TCP port to this orb; prints HOST:PORT to connect to")
+    p.add_argument("device_port", type=int, nargs="?")
+    p.add_argument("--close", action="store_true")
+    p.add_argument("--list", action="store_true")
+    p = cmd("xcuitest", c_xcuitest, "start | status [--follow] | stop an XCUITest runner (e.g. WDA)")
+    p.add_argument("action", choices=["start", "status", "stop"])
+    p.add_argument("runner", nargs="?", help="start: runner bundle id (…xctrunner)")
+    p.add_argument("--target", help="target app bundle id")
+    p.add_argument("--env", action="append", default=[])
+    p.add_argument("--follow", action="store_true")
+    p = cmd("live", c_live, "start (or --stop) the live screen view for a human (Safari/Chrome on macOS/iOS)")
+    p.add_argument("--stop", action="store_true")
+    p = cmd("sign", c_sign, "development-sign an .app / zip / .ipa on the host for this iPhone")
+    p.add_argument("path")
+    p.add_argument("-o", "--output", required=True)
+    p = cmd("processes", c_processes, "running processes")
+    p.add_argument("--json", action="store_true")
+    p = cmd("kill", c_kill, "kill a process of a broker-installed app by pid")
+    p.add_argument("pid", type=int)
+    p = cmd("api", c_api, "raw broker call: iphone api GET /v1/status")
+    p.add_argument("method")
+    p.add_argument("path")
+    p.add_argument("--data", help="JSON body")
+    p.add_argument("--file", help="raw body from a file")
+
+    a = ap.parse_args()
+    if a.cmd == "forward" and not a.list and a.device_port is None:
+        ap.error("forward: DEVICE_PORT or --list")
+    if a.cmd == "xcuitest" and a.action == "start" and not a.runner:
+        ap.error("xcuitest start: RUNNER bundle id required")
+    try:
+        a.fn(a)
+    except Fail as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(e.code)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

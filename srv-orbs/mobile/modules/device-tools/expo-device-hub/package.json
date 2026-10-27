@@ -1,0 +1,8 @@
+{
+  "name": "orb-expo-device-hub",
+  "private": true,
+  "description": "Pinned install of expo-device-hub for amp-orb-mobile (/opt/expo-device-hub); package-lock.json pins every dependency.",
+  "dependencies": {
+    "expo-device-hub": "0.18.0"
+  }
+}

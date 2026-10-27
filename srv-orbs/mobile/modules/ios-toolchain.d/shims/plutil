@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Linux stand-in for Apple's plutil (the subset build tooling uses).
+
+  plutil -convert xml1|binary1|json|swift|objc [-r] [-o OUT|-] [-e EXT] FILE...
+  plutil -extract KEYPATH xml1|binary1|json|raw [-o OUT|-] FILE
+  plutil -insert|-replace KEYPATH -bool|-integer|-float|-string|-date|-data|-xml|-json VALUE FILE
+  plutil -remove KEYPATH FILE
+  plutil -lint FILE...    plutil -p FILE
+FILE may be `-` for stdin. Key paths are dot-separated; array indexes are numbers.
+"""
+import base64
+import datetime
+import json
+import os
+import plistlib
+import sys
+
+
+def die(msg, code=1):
+    print(f"plutil: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load(path):
+    data = sys.stdin.buffer.read() if path == "-" else open(path, "rb").read()
+    try:
+        return plistlib.loads(data)
+    except Exception:
+        try:
+            return json.loads(data)
+        except Exception as e:
+            raise ValueError(f"{path}: not a property list or JSON ({e})")
+
+
+def to_json(value):
+    if isinstance(value, dict):
+        return {k: to_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_json(v) for v in value]
+    if isinstance(value, (bytes, bytearray)):
+        die("invalid object in plist for destination format (data)")
+    if isinstance(value, datetime.datetime):
+        die("invalid object in plist for destination format (date)")
+    return value
+
+
+def dump(value, fmt, readable=False):
+    if fmt == "xml1":
+        return plistlib.dumps(value, fmt=plistlib.FMT_XML)
+    if fmt == "binary1":
+        return plistlib.dumps(value, fmt=plistlib.FMT_BINARY)
+    if fmt == "json":
+        return json.dumps(to_json(value), indent=2 if readable else None,
+                          separators=None if readable else (",", ":"), ensure_ascii=False).encode() + b"\n"
+    if fmt == "raw":
+        if isinstance(value, bool):
+            return b"true\n" if value else b"false\n"
+        if isinstance(value, (int, float, str)):
+            return f"{value}\n".encode()
+        if isinstance(value, (bytes, bytearray)):
+            return base64.b64encode(value) + b"\n"
+        if isinstance(value, datetime.datetime):
+            return value.strftime("%Y-%m-%dT%H:%M:%SZ\n").encode()
+        if isinstance(value, list):
+            return f"{len(value)}\n".encode()
+        if isinstance(value, dict):
+            return "".join(f"{k}\n" for k in value).encode()
+    die(f"unsupported format {fmt}")
+
+
+def write(out, data):
+    if out == "-":
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    else:
+        tmp = out + ".plutil.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out)
+
+
+def walk(root, keypath, create=False):
+    parts = keypath.split(".") if keypath else []
+    node = root
+    for part in parts[:-1]:
+        node = node[int(part)] if isinstance(node, list) else node[part] if not create else node.setdefault(part, {})
+    return node, parts[-1] if parts else None
+
+
+def get(root, keypath):
+    node = root
+    for part in keypath.split(".") if keypath else []:
+        node = node[int(part)] if isinstance(node, list) else node[part]
+    return node
+
+
+def typed(kind, raw):
+    if kind == "-bool":
+        return raw.lower() in ("yes", "true", "1")
+    if kind == "-integer":
+        return int(raw)
+    if kind == "-float":
+        return float(raw)
+    if kind == "-string":
+        return raw
+    if kind == "-date":
+        return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    if kind == "-data":
+        return base64.b64decode(raw)
+    if kind == "-xml":
+        return plistlib.loads(raw.encode())
+    if kind == "-json":
+        return json.loads(raw)
+    if kind in ("-array",):
+        return []
+    if kind in ("-dictionary",):
+        return {}
+    die(f"unknown type {kind}")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-help", "--help", "-h"):
+        print(__doc__.strip())
+        return 0
+    cmd, args = argv[0], argv[1:]
+    out = None
+    readable = False
+    ext = None
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-o":
+            out = args[i + 1]; i += 2; continue
+        if a == "-e":
+            ext = args[i + 1]; i += 2; continue
+        if a == "-r":
+            readable = True; i += 1; continue
+        if a in ("-s", "--"):
+            i += 1; continue
+        rest.append(a); i += 1
+
+    if cmd == "-convert":
+        fmt, files = rest[0], rest[1:]
+        if fmt in ("xml", "binary"):
+            fmt += "1"
+        for f in files:
+            try:
+                data = dump(load(f), fmt, readable)
+            except (ValueError, OSError) as e:
+                die(str(e))
+            dest = out or (f if not ext else os.path.splitext(f)[0] + "." + ext)
+            write("-" if f == "-" and not out else dest, data)
+        return 0
+    if cmd == "-extract":
+        keypath, fmt, f = rest[0], rest[1], rest[2]
+        try:
+            value = get(load(f), keypath)
+        except (KeyError, IndexError, ValueError, TypeError):
+            die(f"Could not extract value, error: No value at that key path or invalid key path: {keypath}")
+        write(out or "-", dump(value, fmt, readable))
+        return 0
+    if cmd in ("-insert", "-replace"):
+        keypath, kind = rest[0], rest[1]
+        value = typed(kind, rest[2]) if kind not in ("-array", "-dictionary") else typed(kind, "")
+        f = rest[-1]
+        raw = open(f, "rb").read()
+        binary = raw.startswith(b"bplist")
+        root = load(f)
+        node, last = walk(root, keypath, create=True)
+        if isinstance(node, list):
+            idx = int(last)
+            if cmd == "-insert":
+                node.insert(idx, value)
+            else:
+                node[idx] = value
+        else:
+            if cmd == "-insert" and last in node:
+                die(f"Could not modify plist, error: Value already exists at key path {keypath}")
+            node[last] = value
+        write(out or f, plistlib.dumps(root, fmt=plistlib.FMT_BINARY if binary else plistlib.FMT_XML))
+        return 0
+    if cmd == "-remove":
+        keypath, f = rest[0], rest[-1]
+        raw = open(f, "rb").read()
+        root = load(f)
+        node, last = walk(root, keypath)
+        try:
+            del node[int(last) if isinstance(node, list) else last]
+        except (KeyError, IndexError):
+            die(f"Could not modify plist, error: No value to remove at key path {keypath}")
+        write(out or f, plistlib.dumps(root, fmt=plistlib.FMT_BINARY if raw.startswith(b"bplist") else plistlib.FMT_XML))
+        return 0
+    if cmd == "-lint":
+        status = 0
+        for f in rest:
+            try:
+                load(f)
+                print(f"{f}: OK")
+            except (ValueError, OSError) as e:
+                print(f"{f}: {e}")
+                status = 1
+        return status
+    if cmd == "-p":
+        import pprint
+        pprint.pprint(load(rest[0]), sort_dicts=False)
+        return 0
+    if cmd == "-type":
+        value = get(load(rest[-1]), rest[0])
+        names = {bool: "bool", int: "integer", float: "float", str: "string", dict: "dictionary",
+                 list: "array", bytes: "data", datetime.datetime: "date"}
+        print(names.get(type(value), "unknown"))
+        return 0
+    die(f"unsupported command {cmd} (Linux stand-in; see plutil -help)", 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

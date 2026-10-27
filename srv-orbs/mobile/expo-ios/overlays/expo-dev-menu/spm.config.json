@@ -1,0 +1,81 @@
+{
+  "products": [
+    {
+      "name": "EXDevMenu",
+      "podName": "expo-dev-menu",
+      "platforms": ["iOS(\"16.4\")"],
+      "externalDependencies": [
+        "ReactNativeDependencies",
+        "React",
+        "Hermes",
+        "expo-modules-core/ExpoModulesCore",
+        "expo-manifests/EXManifests",
+        "expo-dev-menu-interface/EXDevMenuInterface"
+      ],
+      "swiftLanguageVersions": ["5"],
+      "targets": [
+        {
+          "type": "objc",
+          "name": "EXDevMenu_ios_objc_base",
+          "moduleName": "EXDevMenu",
+          "path": "ios",
+          "pattern": "Interceptors/RCTKeyCommands.m",
+          "headerPattern": "{EXDevMenuAppInfo.h,Interceptors/RCTKeyCommands.h}",
+          "exclude": ["Tests/**"],
+          "dependencies": [],
+          "linkedFrameworks": ["Foundation"],
+          "compilerFlags": {
+            "common": ["-DEX_DEV_MENU_ENABLED=1", "-DUSE_HERMES=1", "-DREACT_NATIVE_TARGET_VERSION=88"],
+            "debug": ["-DDEBUG=1"]
+          }
+        },
+        {
+          "type": "swift",
+          "name": "EXDevMenu",
+          "path": "ios",
+          "pattern": "**/*.swift",
+          "exclude": ["Tests/**"],
+          "dependencies": [
+            "Hermes",
+            "React",
+            "ReactNativeDependencies",
+            "expo-modules-core/ExpoModulesCore",
+            "expo-manifests/EXManifests",
+            "expo-dev-menu-interface/EXDevMenuInterface",
+            "EXDevMenu_ios_objc_base"
+          ],
+          "linkedFrameworks": ["Foundation", "UIKit", "SwiftUI", "Combine", "CoreGraphics"],
+          "resources": [{ "path": "ios/Assets.xcassets", "rule": "process" }],
+          "resourceBundleName": "EXDevMenu",
+          "compilerFlags": {
+            "common": ["-DEX_DEV_MENU_ENABLED"],
+            "debug": ["-DDEBUG", "-Xcc", "-DDEBUG=1"]
+          }
+        },
+        {
+          "type": "objc",
+          "name": "EXDevMenu_ios_objc",
+          "moduleName": "EXDevMenu",
+          "path": "ios",
+          "pattern": "EXDevMenuAppInfo.m",
+          "exclude": ["Tests/**"],
+          "dependencies": [
+            "Hermes",
+            "React",
+            "ReactNativeDependencies",
+            "expo-modules-core/ExpoModulesCore",
+            "expo-manifests/EXManifests",
+            "expo-dev-menu-interface/EXDevMenuInterface",
+            "EXDevMenu_ios_objc_base",
+            "EXDevMenu"
+          ],
+          "linkedFrameworks": ["Foundation", "UIKit"],
+          "compilerFlags": {
+            "common": ["-DEX_DEV_MENU_ENABLED=1", "-DUSE_HERMES=1", "-DREACT_NATIVE_TARGET_VERSION=88"],
+            "debug": ["-DDEBUG=1"]
+          }
+        }
+      ]
+    }
+  ]
+}

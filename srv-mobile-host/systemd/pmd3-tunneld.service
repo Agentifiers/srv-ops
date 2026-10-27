@@ -1,0 +1,18 @@
+[Unit]
+Description=pymobiledevice3 tunneld: CoreDevice (RSD) tunnels to USB-attached iPhones, API on 127.0.0.1:49151
+Documentation=https://github.com/Agentifiers/srv-ops/blob/main/srv-mobile-host/README.md
+Wants=usbmuxd.service
+After=network.target usbmuxd.service
+
+[Service]
+# Root: each tunnel is a kernel TUN interface. USB only (no Wi-Fi/mobdev2
+# discovery); the API stays on loopback, the broker is its only client.
+ExecStart=/opt/pymobiledevice3/bin/pymobiledevice3 remote tunneld --host 127.0.0.1 --port 49151 --usb --no-wifi --no-mobdev2
+Environment=HOME=/root PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=3
+# usbmuxd is socket-activated by udev on Arch: when the phone re-enumerates,
+# tunneld reconnects by itself.
+
+[Install]
+WantedBy=multi-user.target

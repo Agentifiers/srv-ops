@@ -1,0 +1,35 @@
+[Unit]
+Description=iphone-broker: leased access to the USB iPhone for Amp orbs over the tailnet
+Documentation=https://github.com/Agentifiers/srv-ops/blob/main/srv-mobile-host/README.md
+Wants=pmd3-tunneld.service network-online.target
+After=pmd3-tunneld.service tailscaled.service network-online.target
+
+[Service]
+User=iphone-broker
+Group=iphone-broker
+EnvironmentFile=/etc/srv-mobile/iphone-broker.env
+Environment=HOME=/var/lib/iphone-broker PYTHONUNBUFFERED=1
+StateDirectory=iphone-broker
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/iphone-broker
+ExecStart=/opt/pymobiledevice3/bin/python /opt/iphone-broker/iphone_broker.py
+# Binding the tailnet address fails until tailscaled has it: just retry.
+Restart=always
+RestartSec=5
+KillMode=control-group
+# The App Store Connect key comes in as credentials (install.sh writes the
+# LoadCredential= drop-in from /etc/srv-mobile/asc.env); nothing else here is secret.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

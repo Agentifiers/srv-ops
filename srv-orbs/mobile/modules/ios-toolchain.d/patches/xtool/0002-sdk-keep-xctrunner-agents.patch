@@ -1,0 +1,13 @@
+diff --git i/Sources/XToolSupport/SDKBuilder.swift w/Sources/XToolSupport/SDKBuilder.swift
+index ebb0a9a..56960df 100644
+--- i/Sources/XToolSupport/SDKBuilder.swift
++++ w/Sources/XToolSupport/SDKBuilder.swift
+@@ -871,6 +871,8 @@ struct SDKEntry {
+                     E("Library", [
+                         E("Frameworks"),
+                         E("PrivateFrameworks"),
++                        // srv-orbs/mobile: XCTRunner.app, the host app template for UI-test runners (WDA, agent-device)
++                        E("Xcode/Agents"),
+                     ]),
+                     E("usr/lib"),
+                 ])

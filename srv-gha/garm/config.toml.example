@@ -1,0 +1,44 @@
+[default]
+enable_webhook_management = true
+
+[logging]
+enable_log_streamer = true
+log_format = "text"
+log_level = "info"
+log_source = false
+
+[metrics]
+enable = true
+disable_auth = false
+
+[jwt_auth]
+secret = "<64 random chars>"
+time_to_live = "8760h"
+
+[apiserver]
+  bind = "@SITE_HOST_TAILNET_IP@"
+  port = @GARM_API_PORT@
+  use_tls = false
+  cors_origins = ["*"]
+  [apiserver.tls]
+    certificate = ""
+    key = ""
+  [apiserver.webui]
+    enable = true
+
+[database]
+  debug = false
+  backend = "sqlite3"
+  passphrase = "<32 random chars>"
+  [database.sqlite3]
+    db_file = "/var/lib/garm/garm.db"
+    busy_timeout_seconds = 5
+
+[[provider]]
+name = "srv"
+description = "Firecracker microVMs via srv"
+provider_type = "external"
+disable_jit_config = false
+  [provider.external]
+  config_file = "/etc/garm/provider-srv.toml"
+  provider_executable = "/usr/local/lib/garm/garm-provider-srv"

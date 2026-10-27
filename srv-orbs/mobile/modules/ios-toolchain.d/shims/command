@@ -1,0 +1,4 @@
+#!/bin/sh
+# `command` as an executable: Ruby backticks such as `command -v ccache` in
+# React Native's CocoaPods utils run it without a shell.
+command "$@"

@@ -1,0 +1,18 @@
+{
+  "@ORB_IMAGE@": {
+    "kernel": "@SRV_IMAGES_DIR@/@ORB_IMAGE@-base/vmlinux",
+    "rootfs": "@SRV_IMAGES_DIR@/@ORB_IMAGE@/rootfs-base.img"
+  },
+  "@GHA_RUNNER_IMAGE@": {
+    "kernel": "@SRV_IMAGES_DIR@/arch-base/vmlinux",
+    "rootfs": "@SRV_IMAGES_DIR@/@GHA_RUNNER_IMAGE@/rootfs-base.img"
+  },
+  "@MOBILE_ORB_IMAGE@": {
+    "kernel": "@SRV_IMAGES_DIR@/mobile-kernel/vmlinux",
+    "rootfs": "@SRV_IMAGES_DIR@/@MOBILE_ORB_IMAGE@/rootfs-base.img"
+  },
+  "@MOBILE_TEST_IMAGE@": {
+    "kernel": "@SRV_IMAGES_DIR@/mobile-kernel/vmlinux",
+    "rootfs": "@SRV_IMAGES_DIR@/@MOBILE_TEST_IMAGE@/rootfs-base.img"
+  }
+}

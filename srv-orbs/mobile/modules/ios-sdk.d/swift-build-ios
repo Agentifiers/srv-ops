@@ -1,0 +1,14 @@
+#!/bin/sh
+# `swift build` for iOS devices (arm64) with the Darwin SDK, set up the way
+# `xtool dev build` runs SwiftBuild on Linux:
+#   swift-build-ios [-c debug|release] [--product X] [any swift build option]
+# IPHONEOS_DEPLOYMENT_TARGET (default 16.4) picks the triple. Do not add
+# --swift-sdk: with SwiftBuild the SDK comes from the platform folders below.
+B=${DARWIN_SDK_BUNDLE:-/opt/swift-sdks/darwin.artifactbundle}
+[ -f "$B/toolset-swb.json" ] || { echo "swift-build-ios: no Darwin SDK at $B" >&2; exit 1; }
+XCODE_EXTRA_PLATFORM_FOLDERS=$B/Developer/Platforms
+PATH=$B/toolset/bin:$PATH
+export XCODE_EXTRA_PLATFORM_FOLDERS PATH
+unset SDKROOT
+exec swift build --build-system swiftbuild --triple "arm64-apple-ios${IPHONEOS_DEPLOYMENT_TARGET:-16.4}" \
+	--toolset "$B/toolset-swb.json" "$@"

@@ -1,0 +1,26 @@
+[Unit]
+Description=bazel-remote cache
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+User=bazel-remote
+Group=bazel-remote
+ExecStart=/usr/local/bin/bazel-remote --dir @BAZEL_REMOTE_DIR@ --max_size @BAZEL_REMOTE_MAX_SIZE_GIB@ --storage_mode zstd --grpc_address @SITE_HOST_TAILNET_IP@:@BAZEL_REMOTE_GRPC_PORT@ --http_address @SITE_HOST_TAILNET_IP@:@BAZEL_REMOTE_HTTP_PORT@ --htpasswd_file /etc/bazel-remote/htpasswd --allow_unauthenticated_reads
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=@BAZEL_REMOTE_DIR@
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

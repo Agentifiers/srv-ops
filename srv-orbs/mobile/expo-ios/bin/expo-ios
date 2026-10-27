@@ -1,0 +1,9 @@
+#!/usr/bin/env node
+// Entry point; installed as /usr/local/bin/expo-ios -> /opt/expo-ios/bin/expo-ios.
+import { realpathSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const here = dirname(realpathSync(new URL(import.meta.url).pathname));
+const { main } = await import(pathToFileURL(join(here, '..', 'lib', 'main.mjs')).href);
+await main(process.argv.slice(2));

@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Linux stand-in for Apple's xcrun. Answers SDK queries from the Darwin Swift
+# SDK bundle (DARWIN_SDK_BUNDLE, built by ios-sdk.sh) and forwards tools to
+# their Linux equivalents: the Swift toolchain's clang linking with ld64.lld,
+# LLVM's binutils, and the stand-ins next to this script. Based on
+# omarchy-apple-dev's flutter/shims/xcrun. XCRUN_SHIM_LOG=<file> records calls.
+set -euo pipefail
+here=$(dirname "$(readlink -f "$0")")
+SDKB=${DARWIN_SDK_BUNDLE:-/opt/swift-sdks/darwin.artifactbundle}
+[ -z "${XCRUN_SHIM_LOG:-}" ] || echo "xcrun $*" >>"$XCRUN_SHIM_LOG"
+
+platform_dir() {
+	case "$1" in
+	iphonesimulator*) echo "$SDKB/Developer/Platforms/iPhoneSimulator.platform" ;;
+	macosx*) echo "$SDKB/Developer/Platforms/MacOSX.platform" ;;
+	*) echo "$SDKB/Developer/Platforms/iPhoneOS.platform" ;;
+	esac
+}
+sdk_path() {
+	local name
+	case "$1" in
+	iphonesimulator*) name=iPhoneSimulator ;;
+	macosx*) name=MacOSX ;;
+	*) name=iPhoneOS ;;
+	esac
+	echo "$(platform_dir "$1")/Developer/SDKs/$name.sdk"
+}
+sdk_setting() { # sdk key
+	local p
+	p=$(sdk_path "$1")
+	[ -f "$p/SDKSettings.json" ] || { echo "xcrun: SDK \"$1\" cannot be located (no Darwin SDK at $SDKB; see ios-sdk.sh)" >&2; exit 1; }
+	python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$p/SDKSettings.json" "$2"
+}
+default_target() { # sdk arch
+	case "$1" in
+	iphonesimulator*) echo "$2-apple-ios${IPHONEOS_DEPLOYMENT_TARGET:-16.4}-simulator" ;;
+	iphoneos*) echo "$2-apple-ios${IPHONEOS_DEPLOYMENT_TARGET:-16.4}" ;;
+	*) echo "$2-apple-macos${MACOSX_DEPLOYMENT_TARGET:-13}" ;;
+	esac
+}
+toolchain_bin() { dirname "$(readlink -f "$(command -v swift)")"; }
+ld64() {
+	if [ -x "$SDKB/toolset/bin/ld64.lld" ]; then echo "$SDKB/toolset/bin/ld64.lld"; else command -v ld64.lld; fi
+}
+
+# clang for Darwin targets. Without -target/-arch it targets the selected SDK
+# (macOS by default, as Xcode's xcrun does); without -isysroot it uses the SDK
+# from the bundle, or links with -nostdlib and dynamic lookup when no SDK is
+# installed (enough for placeholder dylibs such as ExpoModulesJSI's).
+run_clang() { # sdk driver args...
+	local sdk=$1 driver=$2 arch=arm64 has_target= has_sysroot= links=1 a prev=
+	shift 2
+	for a in "$@"; do
+		case "$a" in
+		-target | --target=* | -target=*) has_target=1 ;;
+		-isysroot | --sysroot | --sysroot=*) has_sysroot=1 ;;
+		-c | -E | -S | -M | -MM | -fsyntax-only | --version | -v | -print-* | --print-*) links= ;;
+		esac
+		[ "$prev" != -arch ] || arch=$a
+		prev=$a
+	done
+	local extra=()
+	[ -n "$has_target" ] || extra+=(-target "$(default_target "$sdk" "$arch")")
+	if [ -z "$has_sysroot" ]; then
+		if [ -d "$(sdk_path "$sdk")" ]; then
+			extra+=(-isysroot "$(sdk_path "$sdk")")
+		elif [ -n "$links" ]; then
+			extra+=(-nostdlib -Wl,-undefined,dynamic_lookup)
+		fi
+	fi
+	[ -z "$links" ] || extra+=("-fuse-ld=$(ld64)" -mlinker-version=1200)
+	exec "$(toolchain_bin)/$driver" "${extra[@]}" "$@"
+}
+
+find_tool() { # name -> path
+	case "$1" in
+	clang | clang++ | cc | c++ | swift | swiftc | swift-frontend) echo "$(toolchain_bin)/$1" ;;
+	ld) ld64 ;;
+	*)
+		local c
+		for c in "$here/$1" "llvm-${1//_/-}" "$1"; do
+			if c=$(command -v "$c" 2>/dev/null) && [ "$c" != "$here/xcrun" ]; then echo "$c"; return 0; fi
+		done
+		return 1 ;;
+	esac
+}
+
+sdk_name() { # an SDK name or an SDK path -> iphoneos|iphonesimulator|macosx[version]
+	case "$1" in
+	*iPhoneSimulator*.sdk*) echo iphonesimulator ;;
+	*iPhoneOS*.sdk*) echo iphoneos ;;
+	*MacOSX*.sdk*) echo macosx ;;
+	*) echo "${1,,}" ;;
+	esac
+}
+sdk=$(sdk_name "${SDKROOT:-macosx}")
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--sdk | -sdk) sdk=$(sdk_name "$2"); shift 2 ;;
+	--toolchain | -toolchain) shift 2 ;;
+	-l | --log | -n | --no-cache | -k | --kill-cache | -r | --run | --verbose | -v) shift ;;
+	--version) echo "xcrun version 72."; exit 0 ;;
+	--show-sdk-path) sdk_path "$sdk"; exit 0 ;;
+	--show-sdk-platform-path) platform_dir "$sdk"; exit 0 ;;
+	--show-sdk-version) sdk_setting "$sdk" Version; exit 0 ;;
+	--show-sdk-platform-version) sdk_setting "$sdk" Version; exit 0 ;;
+	--show-sdk-build-version)
+		python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["ProductBuildVersion"])' \
+			"$(sdk_path "$sdk")/System/Library/CoreServices/SystemVersion.plist"
+		exit 0 ;;
+	--show-toolchain-path) dirname "$(dirname "$(toolchain_bin)")"; exit 0 ;;
+	-f | --find)
+		find_tool "$2" || { echo "xcrun: error: unable to find utility \"$2\", not a developer tool or in PATH" >&2; exit 1; }
+		exit 0 ;;
+	-*) echo "xcrun: error: unsupported option $1 (Linux stand-in)" >&2; exit 1 ;;
+	*) break ;;
+	esac
+done
+[ $# -gt 0 ] || { echo "usage: xcrun [--sdk SDK] [--find TOOL | --show-sdk-path | ... | TOOL ARGS...]" >&2; exit 1; }
+
+tool=$1
+shift
+case "$tool" in
+clang | cc) run_clang "$sdk" clang "$@" ;;
+clang++ | c++) run_clang "$sdk" clang++ "$@" ;;
+simctl | devicectl | xctrace | instruments)
+	echo "xcrun $tool: not available on Linux. Use pymobiledevice3 (physical iPhone over the tailnet)." >&2
+	exit 1 ;;
+*)
+	path=$(find_tool "$tool") || { echo "xcrun: error: unable to find utility \"$tool\", not a developer tool or in PATH" >&2; exit 1; }
+	exec "$path" "$@" ;;
+esac

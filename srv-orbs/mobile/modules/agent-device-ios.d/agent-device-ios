@@ -1,0 +1,799 @@
+#!/usr/bin/env python3
+"""agent-device on Linux, driving the host's USB iPhone through the phone broker.
+
+agent-device's Apple backend runs `xcrun devicectl|xctrace|simctl`, `xcodebuild
+test-without-building` and `plutil`, and reaches its XCUITest runner through usbmuxd
+(/var/run/usbmuxd). In the orb there is no Xcode, no usbmuxd and no USB: the phone hangs off
+the host, behind the broker (lease-gated HTTP API). This one program stands in for all of it:
+
+  xcrun devicectl ...        devicectl subset agent-device uses, JSON shaped like CoreDevice's
+  xcrun xctrace list devices
+  xcrun simctl ...           no simulators here: empty lists, anything else fails
+  xcrun <other>              /opt/mobile-shims/bin/xcrun (SDK queries, clang, ...)
+  xcodebuild test-without-building -xctestrun F ...
+                             installs the prebuilt runner (signed by the broker) when the phone
+                             lacks this build, starts it through the broker (XCUITest) and stays
+                             in the foreground relaying its log until it ends or is signalled
+  xcodebuild <other>         /opt/mobile-shims/bin/xcodebuild
+  DevToolsSecurity -status   "enabled" (the runner's host is the broker's, not this machine)
+  agent-device-ios usbmuxd [--socket PATH]
+                             usbmuxd look-alike: ListDevices lists the phone, Connect to a device
+                             port opens a broker TCP forward and splices it (systemd socket unit)
+  agent-device-ios install-runner [--force]
+  agent-device-ios status
+
+The lease: every device operation takes the broker lease first (idempotent for its holder). It
+stays held until `iphone release`/`agent-device-ios release` or the broker's idle timeout.
+
+Env: IPHONE_BROKER_URL (required; set by the orb image), AGENT_DEVICE_IOS_RUNNER_DIR
+(default /opt/agent-device-ios/runner), AGENT_DEVICE_IOS_DEBUG=1 (trace to stderr).
+"""
+
+import asyncio
+import io
+import json
+import os
+import plistlib
+import shutil
+import signal
+import socket
+import struct
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+
+BROKER = os.environ.get("IPHONE_BROKER_URL", "").rstrip("/")
+RUNNER_DIR = os.environ.get("AGENT_DEVICE_IOS_RUNNER_DIR", "/opt/agent-device-ios/runner")
+MOBILE_SHIMS = "/opt/mobile-shims/bin"
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "agent-device-ios")
+DEBUG = os.environ.get("AGENT_DEVICE_IOS_DEBUG") == "1"
+USBMUX_DEVICE_ID = 1
+
+
+def debug(msg):
+    if DEBUG:
+        print(f"agent-device-ios: {msg}", file=sys.stderr, flush=True)
+
+
+class BrokerError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+# --- broker client -----------------------------------------------------------------------------
+
+def broker(method, path, body=None, *, raw=None, content_type=None, timeout=60, binary=False):
+    if not BROKER:
+        raise BrokerError(0, "IPHONE_BROKER_URL is not set (the orb image sets it in /etc/profile.d/mobile-iphone-client.sh)")
+    url = BROKER + path
+    data = None
+    headers = {}
+    if raw is not None:
+        data = raw
+        headers["Content-Type"] = content_type or "application/octet-stream"
+    elif body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    debug(f"{method} {path}")
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = resp.read()
+    except urllib.error.HTTPError as e:
+        text = e.read().decode(errors="replace")
+        try:
+            err = json.loads(text)
+            msg = err.get("error") or text
+            if e.code == 409 and err.get("holder"):
+                msg = f"{msg} (the iPhone is leased by {err['holder']})"
+        except ValueError:
+            msg = text or e.reason
+        raise BrokerError(e.code, f"broker {method} {path}: HTTP {e.code}: {msg}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise BrokerError(0, f"phone broker unreachable at {BROKER}: {getattr(e, 'reason', e)}") from None
+    if binary:
+        return payload
+    if not payload:
+        return None
+    try:
+        return json.loads(payload)
+    except ValueError:
+        return payload.decode(errors="replace")
+
+
+def acquire_lease():
+    broker("POST", "/v1/lease")
+
+
+def phone_status():
+    """The phone as the broker sees it, or None when it is not attached."""
+    status = broker("GET", "/v1/status", timeout=15)
+    phone = (status or {}).get("phone") or {}
+    if not phone.get("connected") or not phone.get("udid"):
+        return None
+    return phone
+
+
+# --- small helpers -----------------------------------------------------------------------------
+
+def fail(msg, code=1):
+    print(msg, file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def take_opt(args, *names, flag=False):
+    """Removes an option (and its value) from args; returns the value, True for flags, or None."""
+    for i, a in enumerate(args):
+        for n in names:
+            if a == n:
+                if flag:
+                    del args[i]
+                    return True
+                if i + 1 >= len(args):
+                    fail(f"missing value for {n}")
+                v = args[i + 1]
+                del args[i:i + 2]
+                return v
+            if not flag and a.startswith(n + "="):
+                del args[i]
+                return a[len(n) + 1:]
+    return None
+
+
+def write_json(path, payload):
+    text = json.dumps(payload, indent=2)
+    if path in (None, "-"):
+        print(text, flush=True)
+        return
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def file_url(path):
+    return "file://" + urllib.parse.quote(path if path.startswith("/") else "/" + path)
+
+
+def device_payload(phone):
+    udid = phone["udid"]
+    name = phone.get("name") or "iPhone"
+    product = phone.get("product_type") or phone.get("productType") or "iPhone"
+    return {
+        "identifier": udid,
+        "name": name,
+        "hardwareProperties": {
+            "platform": "iOS",
+            "udid": udid,
+            "productType": product,
+            "marketingName": phone.get("model") or phone.get("marketing_name") or name,
+            "deviceType": "iPhone",
+        },
+        "deviceProperties": {
+            "name": name,
+            "osVersionNumber": phone.get("ios") or "",
+            "developerModeStatus": "enabled",
+            "ddiServicesAvailable": bool(phone.get("ddi_mounted", True)),
+            "bootState": "booted",
+        },
+        "connectionProperties": {
+            "tunnelState": "connected",
+            "transportType": "wired",
+            "pairingState": "paired",
+        },
+    }
+
+
+def ok_payload(result):
+    return {"info": {"outcome": "success", "jsonVersion": 2}, "result": result}
+
+
+def error_payload(message, code=1):
+    return {"info": {"outcome": "failed", "jsonVersion": 2},
+            "error": {"code": code, "domain": "agent-device-ios", "userInfo": {"NSLocalizedDescription": message}}}
+
+
+# --- xcrun devicectl ---------------------------------------------------------------------------
+
+def devicectl(args):
+    json_out = take_opt(args, "--json-output", "-j")
+    take_opt(args, "--timeout", "-t")
+    take_opt(args, "--quiet", "-q", flag=True)
+    take_opt(args, "--verbose", "-v", flag=True)
+    if args[:1] == ["--version"]:
+        print("agent-device-ios devicectl (phone broker)")
+        return 0
+    try:
+        return devicectl_dispatch(args, json_out)
+    except BrokerError as e:
+        if json_out:
+            write_json(json_out, error_payload(str(e), e.status or 1))
+        print(f"ERROR: {e}", file=sys.stderr, flush=True)
+        return 1
+
+
+def require_device(args):
+    udid = take_opt(args, "--device", "-d")
+    if not udid:
+        fail("ERROR: --device is required")
+    return udid
+
+
+def devicectl_dispatch(args, json_out):
+    cmd = args[:3]
+    if args[:2] == ["list", "devices"]:
+        phone = phone_status()
+        write_json(json_out, ok_payload({"devices": [device_payload(phone)] if phone else []}))
+        return 0
+    if args[:1] != ["device"] or len(args) < 3:
+        print(f"ERROR: devicectl {' '.join(args)}: not supported by the phone broker", file=sys.stderr)
+        return 64
+    rest = args[3:]
+    if cmd == ["device", "info", "details"]:
+        require_device(rest)
+        phone = phone_status()
+        if not phone:
+            write_json(json_out, error_payload("the iPhone is not attached to the host", 2))
+            print("ERROR: the iPhone is not attached to the host", file=sys.stderr)
+            return 1
+        d = device_payload(phone)
+        write_json(json_out, ok_payload({"connectionProperties": d["connectionProperties"],
+                                         "deviceProperties": d["deviceProperties"],
+                                         "hardwareProperties": d["hardwareProperties"]}))
+        return 0
+    if cmd == ["device", "info", "apps"]:
+        require_device(rest)
+        acquire_lease()
+        apps = broker("GET", "/v1/apps?all=1" if "--include-all-apps" in rest else "/v1/apps") or []
+        out = []
+        for a in apps:
+            entry = {"bundleIdentifier": a.get("bundle_id"), "name": a.get("name") or a.get("bundle_id"),
+                     "version": a.get("version"), "bundleVersion": a.get("build")}
+            if a.get("path"):
+                entry["url"] = file_url(a["path"].rstrip("/") + "/")
+            out.append(entry)
+        write_json(json_out, ok_payload({"apps": out}))
+        return 0
+    if cmd == ["device", "info", "processes"]:
+        require_device(rest)
+        acquire_lease()
+        procs = broker("GET", "/v1/device/processes") or []
+        # The broker's paths come from CoreDevice executable URLs (percent-encoded).
+        out = [{"processIdentifier": p["pid"], "executable": file_url(urllib.parse.unquote(p["path"]))}
+               for p in procs if p.get("path") and p.get("pid") is not None]
+        write_json(json_out, ok_payload({"runningProcesses": out}))
+        return 0
+    if cmd == ["device", "info", "displays"]:
+        print("ERROR: display inventory is not available through the phone broker", file=sys.stderr)
+        return 1
+    if cmd == ["device", "process", "launch"]:
+        require_device(rest)
+        payload_url = take_opt(rest, "--payload-url")
+        terminate_existing = bool(take_opt(rest, "--terminate-existing", flag=True))
+        take_opt(rest, "--console", flag=True)
+        take_opt(rest, "--start-stopped", flag=True)
+        env_json = take_opt(rest, "--environment-variables")
+        if not rest:
+            fail("ERROR: missing bundle identifier")
+        bundle_id, app_args = rest[0], rest[1:]
+        if app_args[:1] == ["--"]:
+            app_args = app_args[1:]
+        body = {"args": app_args, "kill_existing": terminate_existing}
+        if env_json:
+            body["env"] = json.loads(env_json)
+        if payload_url:
+            body["url"] = payload_url
+        acquire_lease()
+        res = broker("POST", f"/v1/apps/{urllib.parse.quote(bundle_id)}/launch", body, timeout=120) or {}
+        write_json(json_out, ok_payload({"process": {"processIdentifier": res.get("pid")}}))
+        return 0
+    if cmd == ["device", "process", "terminate"]:
+        require_device(rest)
+        pid = take_opt(rest, "--pid")
+        if not pid:
+            fail("ERROR: --pid is required")
+        acquire_lease()
+        try:
+            broker("POST", f"/v1/device/processes/{int(pid)}/kill")
+        except BrokerError as e:
+            if e.status == 404:
+                write_json(json_out, error_payload(f"No such process: {pid}", 3))
+                print(f"ERROR: No such process (pid {pid})", file=sys.stderr)
+                return 1
+            raise
+        write_json(json_out, ok_payload({}))
+        return 0
+    if cmd == ["device", "install", "app"]:
+        require_device(rest)
+        if not rest:
+            fail("ERROR: missing app path")
+        acquire_lease()
+        bundle_id = install_app(rest[0])
+        write_json(json_out, ok_payload({"installedApplications": [{"bundleID": bundle_id}]}))
+        return 0
+    if cmd == ["device", "uninstall", "app"]:
+        require_device(rest)
+        if not rest:
+            fail("ERROR: missing bundle identifier")
+        acquire_lease()
+        try:
+            broker("DELETE", f"/v1/apps/{urllib.parse.quote(rest[0])}", timeout=120)
+        except BrokerError as e:
+            if e.status == 404:
+                print(f"ERROR: The application is not installed: {rest[0]}", file=sys.stderr)
+                return 1
+            raise
+        write_json(json_out, ok_payload({}))
+        return 0
+    if cmd == ["device", "capture", "screenshot"]:
+        require_device(rest)
+        dest = take_opt(rest, "--destination", "--output")
+        if not dest:
+            fail("ERROR: --destination is required")
+        acquire_lease()
+        png = broker("GET", "/v1/device/screenshot", binary=True, timeout=60)
+        with open(dest, "wb") as f:
+            f.write(png)
+        write_json(json_out, ok_payload({"files": [dest]}))
+        return 0
+    print(f"ERROR: devicectl {' '.join(args)}: not supported by the phone broker", file=sys.stderr)
+    return 64
+
+
+# --- app install (signs unsigned bundles through the broker) -----------------------------------
+
+def bundle_info(app_dir):
+    with open(os.path.join(app_dir, "Info.plist"), "rb") as f:
+        return plistlib.load(f)
+
+
+def zip_app(app_dir, as_ipa):
+    buf = io.BytesIO()
+    base = os.path.basename(app_dir.rstrip("/"))
+    prefix = f"Payload/{base}" if as_ipa else base
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, dirs, files in os.walk(app_dir):
+            rel = os.path.relpath(root, app_dir)
+            arc_root = prefix if rel == "." else f"{prefix}/{rel}"
+            for name in dirs:
+                path = os.path.join(root, name)
+                if os.path.islink(path):
+                    info = zipfile.ZipInfo(f"{arc_root}/{name}")
+                    info.external_attr = (0o120777 << 16)
+                    z.writestr(info, os.readlink(path))
+            for name in files:
+                path = os.path.join(root, name)
+                arc = f"{arc_root}/{name}"
+                if os.path.islink(path):
+                    info = zipfile.ZipInfo(arc)
+                    info.external_attr = (0o120777 << 16)
+                    z.writestr(info, os.readlink(path))
+                else:
+                    z.write(path, arc)
+    return buf.getvalue()
+
+
+def sign_bundle(app_dir, bundle_id):
+    debug(f"signing {app_dir} as {bundle_id}")
+    return broker("POST", f"/v1/sign?bundle_id={urllib.parse.quote(bundle_id)}",
+                  raw=zip_app(app_dir, as_ipa=False), content_type="application/zip",
+                  binary=True, timeout=600)
+
+
+def install_ipa(ipa_bytes):
+    res = broker("POST", "/v1/apps/install", raw=ipa_bytes, timeout=600) or {}
+    return res.get("bundle_id")
+
+
+def install_app(path):
+    """Installs a .app directory or .ipa; development-signs it through the broker when unsigned."""
+    path = os.path.abspath(path)
+    if os.path.isdir(path):
+        info = bundle_info(path)
+        if os.path.exists(os.path.join(path, "embedded.mobileprovision")):
+            return install_ipa(zip_app(path, as_ipa=True)) or info.get("CFBundleIdentifier")
+        return install_ipa(sign_bundle(path, info["CFBundleIdentifier"])) or info.get("CFBundleIdentifier")
+    with open(path, "rb") as f:
+        data = f.read()
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        names = z.namelist()
+        apps = sorted({n.split("/")[1] for n in names if n.startswith("Payload/") and n.count("/") >= 2 and n.split("/")[1].endswith(".app")})
+        if not apps:
+            fail(f"ERROR: {path}: no Payload/*.app inside")
+        app = apps[0]
+        info = plistlib.loads(z.read(f"Payload/{app}/Info.plist"))
+        signed = f"Payload/{app}/embedded.mobileprovision" in names
+    if signed:
+        return install_ipa(data) or info.get("CFBundleIdentifier")
+    signed_ipa = broker("POST", f"/v1/sign?bundle_id={urllib.parse.quote(info['CFBundleIdentifier'])}",
+                        raw=data, content_type="application/zip", binary=True, timeout=600)
+    return install_ipa(signed_ipa) or info.get("CFBundleIdentifier")
+
+
+# --- the prebuilt runner -------------------------------------------------------------------------
+
+def runner_bundles(xctestrun=None):
+    """(host_app_dir, runner_app_dir, build_stamp) of the prebuilt runner.
+
+    agent-device writes its per-session .xctestrun (the runner's env added) into
+    iosXctestEnvDir, so __TESTROOT__ is the directory of the configured .xctestrun
+    (AGENT_DEVICE_IOS_XCTESTRUN_FILE), not of the file xcodebuild is given."""
+    configured = os.environ.get("AGENT_DEVICE_IOS_XCTESTRUN_FILE")
+    roots = [os.path.dirname(os.path.abspath(p)) for p in (xctestrun, configured) if p] + [RUNNER_DIR]
+    target = None
+    if xctestrun:
+        with open(xctestrun, "rb") as f:
+            target = first_test_target(plistlib.load(f))
+    root = next((r for r in roots if target and os.path.isdir(
+        target.get("TestHostPath", "").replace("__TESTROOT__", r))), RUNNER_DIR)
+    if target:
+        host_app = target.get("UITargetAppPath", "").replace("__TESTROOT__", root)
+        runner_app = target.get("TestHostPath", "").replace("__TESTROOT__", root)
+    else:
+        host_app = os.path.join(root, "Release-iphoneos", "AgentDeviceRunner.app")
+        runner_app = os.path.join(root, "Release-iphoneos", "AgentDeviceRunnerUITests-Runner.app")
+    for p in (host_app, runner_app):
+        if not os.path.isfile(os.path.join(p, "Info.plist")):
+            fail(f"agent-device-ios: runner bundle missing: {p}")
+    stamp = bundle_info(runner_app).get("CFBundleVersion", "")
+    return host_app, runner_app, stamp
+
+
+def first_test_target(xctestrun):
+    for config in xctestrun.get("TestConfigurations") or []:
+        for t in config.get("TestTargets") or []:
+            return t
+    for k, v in xctestrun.items():
+        if isinstance(v, dict) and v.get("TestBundlePath"):
+            return v
+    return None
+
+
+def installed_apps():
+    return {a.get("bundle_id"): a for a in (broker("GET", "/v1/apps") or [])}
+
+
+def ensure_runner_installed(host_app, runner_app, stamp, force=False, log=print):
+    ids = [bundle_info(host_app)["CFBundleIdentifier"], bundle_info(runner_app)["CFBundleIdentifier"]]
+    apps = installed_apps()
+    current = all(i in apps and stamp in (str(apps[i].get("build")), str(apps[i].get("version"))) for i in ids)
+    if current and not force:
+        debug(f"runner {stamp} already installed")
+        return ids
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    for app_dir, bundle_id in zip((host_app, runner_app), ids):
+        cached = os.path.join(CACHE_DIR, f"{bundle_id}-{stamp}.ipa")
+        if force or not os.path.exists(cached):
+            log(f"agent-device-ios: signing {os.path.basename(app_dir)} as {bundle_id} (phone broker)")
+            ipa = sign_bundle(app_dir, bundle_id)
+            tmp = cached + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(ipa)
+            os.replace(tmp, cached)
+        log(f"agent-device-ios: installing {bundle_id} ({stamp})")
+        with open(cached, "rb") as f:
+            install_ipa(f.read())
+    return ids
+
+
+# --- xcodebuild test-without-building --------------------------------------------------------------
+
+def xcodebuild(args):
+    if not args or args[0] != "test-without-building":
+        os.execv(os.path.join(MOBILE_SHIMS, "xcodebuild"), ["xcodebuild", *args])
+    xctestrun = take_opt(args, "-xctestrun")
+    if not xctestrun:
+        fail("xcodebuild: -xctestrun is required (agent-device-ios runs prebuilt runners only)")
+    with open(xctestrun, "rb") as f:
+        target = first_test_target(plistlib.load(f)) or {}
+    env = {k: str(v) for k, v in (target.get("EnvironmentVariables") or {}).items()}
+    env.update({k: str(v) for k, v in (target.get("TestingEnvironmentVariables") or {}).items()
+                if k.startswith("AGENT_DEVICE_")})
+
+    def out(line):
+        print(line, flush=True)
+
+    try:
+        host_app, runner_app, stamp = runner_bundles(xctestrun)
+        acquire_lease()
+        target_id, runner_id = ensure_runner_installed(host_app, runner_app, stamp, log=out)
+        try:
+            broker("DELETE", "/v1/xcuitest")
+        except BrokerError:
+            pass
+        out(f"agent-device-ios: starting {runner_id} (target {target_id}) through the phone broker")
+        broker("POST", "/v1/xcuitest", {"runner_bundle_id": runner_id, "target_bundle_id": target_id,
+                                         "env": env, "args": []}, timeout=120)
+    except BrokerError as e:
+        out(f"xcodebuild: error: {e}")
+        return 70
+
+    stopping = {"flag": False}
+
+    def stop(signum, _frame):
+        stopping["flag"] = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGHUP, stop)
+    seq = 0
+    failures = 0
+    code = 0
+    while not stopping["flag"]:
+        try:
+            st = broker("GET", f"/v1/xcuitest?since={seq}", timeout=20) or {}
+            failures = 0
+        except BrokerError as e:
+            failures += 1
+            # 404: the runner is gone (stopped or replaced); 409/403: the lease is gone.
+            if e.status in (403, 404, 409) or failures >= 10:
+                out(f"xcodebuild: error: {e}")
+                code = 70
+                break
+            time.sleep(1)
+            continue
+        for line in st.get("log") or []:
+            out(line)
+        seq = st.get("log_seq", seq)
+        if st.get("state") != "running":
+            rc = st.get("returncode")
+            out(f"agent-device-ios: runner exited ({rc})")
+            code = 0 if rc == 0 else 65
+            break
+        time.sleep(0.5)
+    if stopping["flag"]:
+        try:
+            broker("DELETE", "/v1/xcuitest", timeout=20)
+        except BrokerError:
+            pass
+        out("agent-device-ios: runner stopped")
+        return 143
+    return code
+
+
+# --- xcrun ---------------------------------------------------------------------------------------
+
+def xctrace(args):
+    if args[:2] != ["list", "devices"]:
+        print("xctrace: only `list devices` is available on Linux", file=sys.stderr)
+        return 1
+    try:
+        phone = phone_status()
+    except BrokerError as e:
+        print(f"xctrace: {e}", file=sys.stderr)
+        return 1
+    print("== Devices ==")
+    if phone:
+        print(f"{phone.get('name') or 'iPhone'} ({phone.get('ios') or ''}) ({phone['udid']})")
+    print("\n== Simulators ==")
+    return 0
+
+
+def simctl(args):
+    if args[:1] == ["list"]:
+        if "-j" in args or "--json" in args:
+            print(json.dumps({"devicetypes": [], "runtimes": [], "devices": {}, "pairs": {}}))
+        else:
+            print("== Devices ==")
+        return 0
+    print("simctl: no iOS Simulator on Linux (the phone broker serves one physical iPhone)", file=sys.stderr)
+    return 1
+
+
+def xcrun(args):
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in ("--sdk", "-sdk", "--toolchain", "-toolchain"):
+            i += 2
+        elif args[i] in ("-l", "--log", "-n", "--no-cache", "-k", "--kill-cache", "-r", "--run", "-v", "--verbose"):
+            i += 1
+        else:
+            break
+    tool = args[i] if i < len(args) else None
+    if tool == "devicectl":
+        return devicectl(list(args[i + 1:]))
+    if tool == "xctrace":
+        return xctrace(list(args[i + 1:]))
+    if tool == "simctl":
+        return simctl(list(args[i + 1:]))
+    if tool == "xcodebuild":
+        return xcodebuild(list(args[i + 1:]))
+    os.execv(os.path.join(MOBILE_SHIMS, "xcrun"), ["xcrun", *args])
+
+
+# --- usbmuxd look-alike ----------------------------------------------------------------------------
+
+class Usbmux:
+    def __init__(self):
+        self.forwards = {}  # device port -> (host, port)
+        self.phone = None
+        self.phone_at = 0.0
+
+    async def call(self, fn, *a, **kw):
+        return await asyncio.get_running_loop().run_in_executor(None, lambda: fn(*a, **kw))
+
+    async def current_phone(self):
+        if time.monotonic() - self.phone_at > 5:
+            try:
+                self.phone = await self.call(phone_status)
+            except BrokerError as e:
+                debug(str(e))
+                self.phone = None
+            self.phone_at = time.monotonic()
+        return self.phone
+
+    def device_record(self, phone):
+        return {"DeviceID": USBMUX_DEVICE_ID, "MessageType": "Attached",
+                "Properties": {"ConnectionType": "USB", "DeviceID": USBMUX_DEVICE_ID,
+                               "SerialNumber": phone["udid"], "LocationID": 0, "ProductID": 0x12a8,
+                               "ConnectionSpeed": 480000000}}
+
+    async def send(self, writer, tag, payload):
+        body = plistlib.dumps(payload, fmt=plistlib.FMT_XML)
+        writer.write(struct.pack("<IIII", 16 + len(body), 1, 8, tag) + body)
+        await writer.drain()
+
+    async def forward(self, port, refresh=False):
+        if refresh or port not in self.forwards:
+            await self.call(acquire_lease)
+            res = await self.call(broker, "POST", "/v1/forward", {"device_port": port})
+            self.forwards[port] = (res["host"], int(res["port"]))
+        return self.forwards[port]
+
+    async def open_device_port(self, port):
+        last = None
+        for refresh in (False, True):
+            try:
+                host, fport = await self.forward(port, refresh)
+                return await asyncio.wait_for(asyncio.open_connection(host, fport), 10)
+            except (OSError, asyncio.TimeoutError, BrokerError, KeyError, ValueError) as e:
+                last = e
+                debug(f"forward to device port {port}: {e}")
+                self.forwards.pop(port, None)
+        raise ConnectionRefusedError(str(last))
+
+    async def handle(self, reader, writer):
+        try:
+            while True:
+                header = await reader.readexactly(16)
+                length, version, mtype, tag = struct.unpack("<IIII", header)
+                body = await reader.readexactly(length - 16) if length > 16 else b""
+                if mtype != 8:
+                    await self.send(writer, tag, {"MessageType": "Result", "Number": 1})
+                    continue
+                msg = plistlib.loads(body)
+                kind = msg.get("MessageType")
+                debug(f"usbmux {kind}")
+                if kind == "ListDevices":
+                    phone = await self.current_phone()
+                    await self.send(writer, tag, {"DeviceList": [self.device_record(phone)] if phone else []})
+                elif kind == "Listen":
+                    await self.send(writer, tag, {"MessageType": "Result", "Number": 0})
+                    phone = await self.current_phone()
+                    if phone:
+                        await self.send(writer, 0, self.device_record(phone))
+                    await reader.read()  # events are never sent again; hold until the client leaves
+                    return
+                elif kind == "Connect":
+                    if msg.get("DeviceID") != USBMUX_DEVICE_ID or not await self.current_phone():
+                        await self.send(writer, tag, {"MessageType": "Result", "Number": 2})
+                        return
+                    raw = int(msg.get("PortNumber", 0))
+                    port = ((raw & 0xFF) << 8) | ((raw >> 8) & 0xFF)
+                    try:
+                        dreader, dwriter = await self.open_device_port(port)
+                    except ConnectionRefusedError:
+                        await self.send(writer, tag, {"MessageType": "Result", "Number": 3})
+                        return
+                    await self.send(writer, tag, {"MessageType": "Result", "Number": 0})
+                    await splice(reader, writer, dreader, dwriter)
+                    return
+                else:
+                    await self.send(writer, tag, {"MessageType": "Result", "Number": 1})
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+
+async def splice(r1, w1, r2, w2):
+    async def pipe(r, w):
+        try:
+            while True:
+                data = await r.read(65536)
+                if not data:
+                    break
+                w.write(data)
+                await w.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            try:
+                if w.can_write_eof():
+                    w.write_eof()
+            except (OSError, RuntimeError):
+                pass
+
+    await asyncio.gather(pipe(r1, w2), pipe(r2, w1))
+    w2.close()
+
+
+async def usbmuxd_main(path):
+    mux = Usbmux()
+    if os.environ.get("LISTEN_FDS") == "1" and os.environ.get("LISTEN_PID") in (None, str(os.getpid())):
+        sock = socket.socket(fileno=3)
+        server = await asyncio.start_unix_server(mux.handle, sock=sock)
+    else:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        server = await asyncio.start_unix_server(mux.handle, path=path)
+        os.chmod(path, 0o666)
+    async with server:
+        await server.serve_forever()
+
+
+# --- entry -----------------------------------------------------------------------------------------
+
+def status():
+    try:
+        st = broker("GET", "/v1/status")
+    except BrokerError as e:
+        fail(str(e))
+    print(json.dumps(st, indent=2))
+    host_app, runner_app, stamp = runner_bundles()
+    print(f"runner build {stamp}: {bundle_info(runner_app)['CFBundleIdentifier']}, {bundle_info(host_app)['CFBundleIdentifier']}")
+    return 0
+
+
+def main():
+    name = os.path.basename(sys.argv[0])
+    args = sys.argv[1:]
+    if name == "xcrun":
+        return xcrun(args)
+    if name == "xcodebuild":
+        return xcodebuild(args)
+    if name == "DevToolsSecurity":
+        # The macOS debugger-access setting agent-device checks before starting a device runner;
+        # here the broker's host runs the runner, so there is nothing to gate.
+        print("Developer mode is currently enabled.")
+        return 0
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    cmd, rest = args[0], args[1:]
+    if cmd == "xcrun":
+        return xcrun(rest)
+    if cmd == "xcodebuild":
+        return xcodebuild(rest)
+    if cmd == "usbmuxd":
+        path = take_opt(rest, "--socket") or "/run/usbmuxd"
+        asyncio.run(usbmuxd_main(path))
+        return 0
+    if cmd == "install-runner":
+        force = bool(take_opt(rest, "--force", flag=True))
+        try:
+            acquire_lease()
+            host_app, runner_app, stamp = runner_bundles()
+            ids = ensure_runner_installed(host_app, runner_app, stamp, force=force)
+        except BrokerError as e:
+            fail(str(e))
+        print(f"runner {stamp} installed: {', '.join(ids)}")
+        return 0
+    if cmd == "release":
+        try:
+            broker("DELETE", "/v1/lease")
+        except BrokerError as e:
+            fail(str(e))
+        return 0
+    if cmd == "status":
+        return status()
+    fail(f"agent-device-ios: unknown command {cmd} (see --help)")
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Stop redroid and disconnect adb. --wipe also deletes the container and its
+# /data volume (installed apps, settings).
+#
+#   redroid-down [--wipe]
+set -euo pipefail
+
+NAME="${REDROID_NAME:-redroid}"
+PORT="${REDROID_PORT:-5555}"
+ADB="${ADB:-adb}"
+
+sudo_() { if [[ $(id -u) == 0 ]]; then "$@"; else sudo -n "$@"; fi; }
+docker_() { if docker info >/dev/null 2>&1; then docker "$@"; else sudo_ docker "$@"; fi; }
+
+wipe=0
+case "${1:-}" in
+"") ;;
+--wipe) wipe=1 ;;
+*) echo "usage: redroid-down [--wipe]" >&2; exit 2 ;;
+esac
+
+"$ADB" disconnect "127.0.0.1:$PORT" >/dev/null 2>&1 || true
+if docker_ inspect "$NAME" >/dev/null 2>&1; then
+	docker_ stop -t 20 "$NAME" >/dev/null
+	if (( wipe )); then
+		docker_ rm "$NAME" >/dev/null
+		docker_ volume rm -f "$NAME-data" >/dev/null
+	fi
+fi
+echo "redroid-down: $NAME stopped$( (( wipe )) && echo ' and wiped')"

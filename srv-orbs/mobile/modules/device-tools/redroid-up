@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Start redroid (Android in a container, software GPU) and connect adb to it.
+#
+#   redroid-up [extra androidboot.* args]
+#
+# Env: REDROID_NAME (container, default redroid), REDROID_PORT (host adb port,
+# default 5555, bound to 127.0.0.1), REDROID_IMAGE (default: the prefetched
+# image), REDROID_BOOT_TIMEOUT (seconds, default 300).
+# App data persists in the docker volume "$REDROID_NAME-data"; `redroid-down
+# --wipe` removes it.
+set -euo pipefail
+
+IMAGE="${REDROID_IMAGE:-@REDROID_IMAGE@}"
+TARBALL=/opt/redroid/redroid.tar
+NAME="${REDROID_NAME:-redroid}"
+PORT="${REDROID_PORT:-5555}"
+TIMEOUT="${REDROID_BOOT_TIMEOUT:-300}"
+SERIAL="127.0.0.1:$PORT"
+ADB="${ADB:-adb}"
+
+sudo_() { if [[ $(id -u) == 0 ]]; then "$@"; else sudo -n "$@"; fi; }
+docker_() { if docker info >/dev/null 2>&1; then docker "$@"; else sudo_ docker "$@"; fi; }
+log() { echo "redroid-up: $*" >&2; }
+
+# redroid needs binder from the kernel; Android's init mounts binderfs itself
+# inside the privileged container, but the filesystem type must exist.
+if ! grep -qw binder /proc/filesystems; then
+	sudo_ modprobe binder_linux 2>/dev/null || true
+	grep -qw binder /proc/filesystems || { log "kernel has no binderfs (CONFIG_ANDROID_BINDERFS); use the mobile kernel"; exit 1; }
+fi
+if ! mountpoint -q /dev/binderfs; then
+	sudo_ mkdir -p /dev/binderfs
+	sudo_ mount -t binder binder /dev/binderfs
+fi
+# Without PSI, Android's lmkd exits and system_server stalls on every app
+# start (ANRs, black screen).
+[[ -r /proc/pressure/memory ]] && cat /proc/pressure/memory >/dev/null 2>&1 \
+	|| { log "kernel PSI is off (/proc/pressure/memory); boot with psi=1 or the mobile kernel"; exit 1; }
+# Android 16's surfaceflinger allocates from /dev/ashmem and crash-loops
+# ("output buffer not gpu writeable") without it. The mobile kernel builds
+# ashmem in (CONFIG_ASHMEM); upstream kernels have none.
+[[ -c /dev/ashmem ]] \
+	|| { log "/dev/ashmem is missing; Android 16 needs the mobile kernel's built-in ashmem (CONFIG_ASHMEM)"; exit 1; }
+
+systemctl is-active -q docker || sudo_ systemctl start docker
+
+if ! docker_ image inspect "$IMAGE" >/dev/null 2>&1; then
+	[[ -f $TARBALL ]] || { log "$IMAGE not present and $TARBALL missing"; exit 1; }
+	log "loading $TARBALL (first start only)"
+	docker_ load -i "$TARBALL" >&2
+fi
+
+start=$SECONDS
+state="$(docker_ inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || true)"
+case "$state" in
+running) log "$NAME already running" ;;
+"")
+	log "starting $NAME ($IMAGE)"
+	docker_ run -d --name "$NAME" --privileged \
+		-p "127.0.0.1:$PORT:5555" \
+		-v "$NAME-data:/data" \
+		"$IMAGE" \
+		androidboot.use_memfd=1 \
+		androidboot.redroid_gpu_mode=guest \
+		"$@" >/dev/null
+	;;
+*)
+	[[ $# == 0 ]] || log "container exists; ignoring boot args (redroid-down first to change them)"
+	docker_ start "$NAME" >/dev/null
+	;;
+esac
+
+start=$SECONDS
+until [[ "$("$ADB" -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == 1 ]]; do
+	if (( SECONDS - start > TIMEOUT )); then
+		log "timed out after ${TIMEOUT}s waiting for sys.boot_completed; docker logs $NAME:"
+		docker_ logs --tail 50 "$NAME" >&2 || true
+		exit 1
+	fi
+	[[ "$(docker_ inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" == true ]] || {
+		log "$NAME exited; docker logs:"; docker_ logs --tail 50 "$NAME" >&2 || true; exit 1; }
+	"$ADB" connect "$SERIAL" >/dev/null 2>&1 || true
+	sleep 2
+done
+log "booted in $((SECONDS - start))s"
+"$ADB" connect "$SERIAL"

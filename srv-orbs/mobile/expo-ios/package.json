@@ -1,0 +1,6 @@
+{
+  "name": "expo-ios",
+  "private": true,
+  "type": "module",
+  "description": "Build Expo iOS apps on Linux (see README.md)"
+}

@@ -1,0 +1,21 @@
+{
+  "products": [
+    {
+      "name": "EXDevMenuInterface",
+      "podName": "expo-dev-menu-interface",
+      "platforms": ["iOS(\"16.4\")"],
+      "externalDependencies": [],
+      "swiftLanguageVersions": ["5"],
+      "targets": [
+        {
+          "type": "swift",
+          "name": "EXDevMenuInterface",
+          "path": "ios",
+          "pattern": "*.swift",
+          "dependencies": [],
+          "linkedFrameworks": ["Foundation", "UIKit"]
+        }
+      ]
+    }
+  ]
+}

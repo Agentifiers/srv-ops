@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Joins the tailnet as a temporary node using the orb's Amp workload identity
+# (https://ampcode.com/docs/orbs/customizing#use-tailscale). It runs on every
+# boot, and each wake is a fresh boot. tailscaled keeps its state only in
+# memory, so neither the disk nor project snapshots carry a node identity.
+set -euo pipefail
+
+# shellcheck source=/dev/null
+. /etc/amp-orb-tailscale.env
+# shellcheck source=/dev/null
+. /etc/amp-orb.env
+export PATH
+
+: "${TAILSCALE_CLIENT_ID:?}" "${TAILSCALE_AUDIENCE:?}" "${TAILSCALE_TAGS:?}"
+
+umask 077
+token=$(mktemp)
+trap 'rm -f "$token"' EXIT
+
+# id-token works only after `amp orb bootstrap` has connected this orb to its
+# thread, which can take a while after boot.
+deadline=$((SECONDS + ${TAILSCALE_JOIN_TIMEOUT:-900}))
+until runuser -u user -- env HOME=/home/user PATH="$PATH" \
+	amp orb id-token --audience "$TAILSCALE_AUDIENCE" --subject-scope workspace >"$token" 2>/run/amp-orb-tailscale.err; do
+	if ((SECONDS >= deadline)); then
+		echo "amp orb id-token kept failing:" >&2
+		cat /run/amp-orb-tailscale.err >&2
+		exit 1
+	fi
+	sleep 3
+done
+rm -f /run/amp-orb-tailscale.err
+
+# Name the node after the thread so it's findable in `tailscale status`.
+payload=$(cut -d. -f2 "$token" | tr '_-' '/+')
+case $((${#payload} % 4)) in 2) payload+='==' ;; 3) payload+='=' ;; esac
+thread=$(base64 -d <<<"$payload" 2>/dev/null | jq -r '.thread_id // .threadId // .thread // empty' 2>/dev/null || true)
+name=amp-orb
+if [[ -n $thread ]]; then
+	name=$(printf 'amp-%s' "${thread#T-}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-63 | sed 's/-*$//')
+fi
+
+systemctl start tailscaled.service
+tailscale up \
+	--client-id="${TAILSCALE_CLIENT_ID}?ephemeral=true&preauthorized=true" \
+	--id-token="file:$token" \
+	--advertise-tags="$TAILSCALE_TAGS" \
+	--hostname="$name" \
+	--ssh
+tailscale ip -4

@@ -1,0 +1,93 @@
+{
+  "products": [
+    {
+      "name": "EXDevLauncher",
+      "podName": "expo-dev-launcher",
+      "platforms": ["iOS(\"16.4\")"],
+      "externalDependencies": [
+        "ReactNativeDependencies",
+        "React",
+        "Hermes",
+        "expo-modules-core/ExpoModulesCore",
+        "expo-manifests/EXManifests",
+        "expo-updates-interface/EXUpdatesInterface",
+        "expo-dev-menu-interface/EXDevMenuInterface",
+        "expo-dev-menu/EXDevMenu"
+      ],
+      "swiftLanguageVersions": ["5"],
+      "targets": [
+        {
+          "type": "objc",
+          "name": "EXDevLauncher_ios_objc_base",
+          "moduleName": "EXDevLauncher",
+          "path": "ios",
+          "pattern": "{EXDevLauncherUpdatesHelper.m,ReactNative/EXDevLauncherRCTDevSettings.m}",
+          "headerPattern": "{EXDevLauncher.h,EXDevLauncherController.h,EXDevLauncherUpdatesHelper.h,Manifest/EXDevLauncherManifestParser.h,ReactNative/EXDevLauncherRCTDevSettings.h,Headers/EXDevLauncherReactImports.h}",
+          "exclude": ["Tests/**"],
+          "dependencies": [
+            "Hermes",
+            "React",
+            "ReactNativeDependencies",
+            "expo-modules-core/ExpoModulesCore",
+            "expo-manifests/EXManifests",
+            "expo-updates-interface/EXUpdatesInterface"
+          ],
+          "linkedFrameworks": ["Foundation", "UIKit"],
+          "compilerFlags": {
+            "common": ["-DEX_DEV_LAUNCHER_VERSION=${PACKAGE_VERSION}", "-DUSE_HERMES=1", "-DREACT_NATIVE_TARGET_VERSION=88"],
+            "debug": ["-DDEBUG=1"]
+          }
+        },
+        {
+          "type": "swift",
+          "name": "EXDevLauncher",
+          "path": "ios",
+          "pattern": "**/*.swift",
+          "exclude": ["Tests/**"],
+          "dependencies": [
+            "Hermes",
+            "React",
+            "ReactNativeDependencies",
+            "expo-modules-core/ExpoModulesCore",
+            "expo-manifests/EXManifests",
+            "expo-updates-interface/EXUpdatesInterface",
+            "expo-dev-menu-interface/EXDevMenuInterface",
+            "expo-dev-menu/EXDevMenu",
+            "EXDevLauncher_ios_objc_base"
+          ],
+          "linkedFrameworks": ["Foundation", "UIKit", "SwiftUI", "Network", "AuthenticationServices"],
+          "resources": [{ "path": "ios/Assets.xcassets", "rule": "process" }],
+          "resourceBundleName": "EXDevLauncher",
+          "compilerFlags": {
+            "debug": ["-DDEBUG", "-DEX_DEV_CLIENT_NETWORK_INSPECTOR", "-Xcc", "-DDEBUG=1"]
+          }
+        },
+        {
+          "type": "objc",
+          "name": "EXDevLauncher_ios_objc",
+          "moduleName": "EXDevLauncher",
+          "path": "ios",
+          "pattern": "{EXDevLauncher.m,EXDevLauncherController.m,Manifest/EXDevLauncherManifestParser.m}",
+          "exclude": ["Tests/**"],
+          "dependencies": [
+            "Hermes",
+            "React",
+            "ReactNativeDependencies",
+            "expo-modules-core/ExpoModulesCore",
+            "expo-manifests/EXManifests",
+            "expo-updates-interface/EXUpdatesInterface",
+            "expo-dev-menu-interface/EXDevMenuInterface",
+            "expo-dev-menu/EXDevMenu",
+            "EXDevLauncher_ios_objc_base",
+            "EXDevLauncher"
+          ],
+          "linkedFrameworks": ["Foundation", "UIKit"],
+          "compilerFlags": {
+            "common": ["-DEX_DEV_LAUNCHER_VERSION=${PACKAGE_VERSION}", "-DUSE_HERMES=1", "-DREACT_NATIVE_TARGET_VERSION=88"],
+            "debug": ["-DDEBUG=1"]
+          }
+        }
+      ]
+    }
+  ]
+}

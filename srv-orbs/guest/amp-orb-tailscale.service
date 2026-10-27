@@ -1,0 +1,14 @@
+[Unit]
+Description=Join the tailnet with this orb's Amp workload identity
+Wants=network-online.target
+After=network-online.target srv-orb-guest.service
+
+[Service]
+# exec, not oneshot: boot must not wait for Amp to connect the orb.
+Type=exec
+ExecStart=/usr/local/lib/srv/amp-orb-tailscale
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,154 @@
+diff --git c/Sources/XKit/GrandSlam/Anisette/ADIDataProvider.swift i/Sources/XKit/GrandSlam/Anisette/ADIDataProvider.swift
+index d259a46..16ee784 100644
+--- c/Sources/XKit/GrandSlam/Anisette/ADIDataProvider.swift
++++ i/Sources/XKit/GrandSlam/Anisette/ADIDataProvider.swift
+@@ -4,7 +4,7 @@ import ConcurrencyExtras
+ import Dependencies
+ 
+ public protocol RawADIProvider: Sendable {
+-    func clientInfo() async throws -> String
++    func clientInfo() async throws -> ClientInfoWithUserAgent
+ 
+     func startProvisioning(
+         spim: Data,
+@@ -18,6 +18,11 @@ public protocol RawADIProvider: Sendable {
+     ) async throws -> (machineID: Data, otp: Data)
+ }
+ 
++public struct ClientInfoWithUserAgent: Sendable {
++    public let clientInfo: String
++    public let akdUserAgent: String
++}
++
+ private struct UnimplementedRawADIProvider: RawADIProvider {
+     func startProvisioning(
+         spim: Data,
+@@ -36,8 +41,8 @@ private struct UnimplementedRawADIProvider: RawADIProvider {
+         return try await closure(userID, &routingInfo, provisioningInfo)
+     }
+ 
+-    func clientInfo() async throws -> String {
+-        let closure: () async throws -> String = unimplemented()
++    func clientInfo() async throws -> ClientInfoWithUserAgent {
++        let closure: () async throws -> ClientInfoWithUserAgent = unimplemented()
+         return try await closure()
+     }
+ }
+@@ -80,7 +85,7 @@ public struct ADIDataProvider: AnisetteDataProvider {
+     private let localUserUID: UUID
+     private let localUserID: String
+ 
+-    private let _clientInfo = LockIsolated<String?>(nil)
++    private let _clientInfo = LockIsolated<ClientInfoWithUserAgent?>(nil)
+ 
+     public init() {
+         @Dependency(\.keyValueStorage) var storage
+@@ -145,7 +150,7 @@ public struct ADIDataProvider: AnisetteDataProvider {
+         return encoder
+     }()
+ 
+-    private func clientInfo() async throws -> String {
++    private func clientInfo() async throws -> ClientInfoWithUserAgent {
+         if let clientInfo = _clientInfo.value { return clientInfo }
+         let clientInfo = try await rawProvider.clientInfo()
+         _clientInfo.setValue(clientInfo)
+@@ -275,9 +280,11 @@ public struct ADIDataProvider: AnisetteDataProvider {
+     }
+ 
+     public func deviceInfo() async throws -> DeviceInfo {
+-        DeviceInfo(
++        let clientInfo = try await clientInfo()
++        return DeviceInfo(
+             deviceID: localUserUID.uuidString,
+-            clientInfo: try await clientInfo(),
++            clientInfo: clientInfo.clientInfo,
++            akdUserAgent: clientInfo.akdUserAgent,
+         )
+     }
+ 
+diff --git c/Sources/XKit/GrandSlam/Anisette/DeviceInfo.swift i/Sources/XKit/GrandSlam/Anisette/DeviceInfo.swift
+index bc0b045..dab423f 100644
+--- c/Sources/XKit/GrandSlam/Anisette/DeviceInfo.swift
++++ i/Sources/XKit/GrandSlam/Anisette/DeviceInfo.swift
+@@ -3,7 +3,6 @@ import Foundation
+ public struct DeviceInfo: Codable, Sendable {
+     public static let xcodeVersionKey = "X-Xcode-Version"
+     public static let xcodeVersion = "26.5 (17F42)"
+-    public static let akdUserAgent = "akd/1.0 CFNetwork/808.1.4"
+ 
+     public static let deviceIDKey = "X-Mme-Device-Id"
+     public let deviceID: String
+@@ -11,6 +10,8 @@ public struct DeviceInfo: Codable, Sendable {
+     public static let clientInfoKey = "X-MMe-Client-Info"
+     public let clientInfo: String
+ 
++    public let akdUserAgent: String
++
+     public var dictionary: [String: String] {
+         [
+             Self.clientInfoKey: clientInfo,
+diff --git c/Sources/XKit/GrandSlam/Anisette/OmnisetteADIProvider.swift i/Sources/XKit/GrandSlam/Anisette/OmnisetteADIProvider.swift
+index 2bd146c..8ffc29f 100644
+--- c/Sources/XKit/GrandSlam/Anisette/OmnisetteADIProvider.swift
++++ i/Sources/XKit/GrandSlam/Anisette/OmnisetteADIProvider.swift
+@@ -27,15 +27,19 @@ struct OmnisetteADIProvider: RawADIProvider {
+         return encoder
+     }()
+ 
+-    func clientInfo() async throws -> String {
++    func clientInfo() async throws -> ClientInfoWithUserAgent {
+         struct ClientInfo: Decodable {
+             let clientInfo: String
++            let userAgent: String
+         }
+         let body = try await client.makeRequest(
+             HTTPRequest(url: url.appendingPathComponent("v3/client_info"))
+         ).body
+         let clientInfo = try Self.decoder.decode(ClientInfo.self, from: body)
+-        return clientInfo.clientInfo
++        return ClientInfoWithUserAgent(
++            clientInfo: clientInfo.clientInfo,
++            akdUserAgent: clientInfo.userAgent,
++        )
+     }
+ 
+     func startProvisioning(spim: Data, userID: UUID) async throws -> (RawADIProvisioningSession, Data) {
+diff --git c/Sources/XKit/GrandSlam/Lookup/GrandSlamLookupManager.swift i/Sources/XKit/GrandSlam/Lookup/GrandSlamLookupManager.swift
+index 91dd344..756afa1 100644
+--- c/Sources/XKit/GrandSlam/Lookup/GrandSlamLookupManager.swift
++++ i/Sources/XKit/GrandSlam/Lookup/GrandSlamLookupManager.swift
+@@ -31,7 +31,7 @@ actor GrandSlamLookupManager {
+ 
+         var request = HTTPRequest(url: Self.lookupURL)
+         request.headerFields = [
+-            .userAgent: DeviceInfo.akdUserAgent,
++            .userAgent: deviceInfo.akdUserAgent,
+             .init(AnisetteData.iLocaleKey)!: Locale.current.identifier,
+             .init(AnisetteData.timeZoneKey)!: TimeZone.current.identifier,
+             .init("X-Apple-I-TimeZone-Offset")!: "\(TimeZone.current.secondsFromGMT())"
+diff --git c/Sources/XKit/GrandSlam/Requests/GrandSlamOperationRequest.swift i/Sources/XKit/GrandSlam/Requests/GrandSlamOperationRequest.swift
+index 13f94bf..26c9ee9 100644
+--- c/Sources/XKit/GrandSlam/Requests/GrandSlamOperationRequest.swift
++++ i/Sources/XKit/GrandSlam/Requests/GrandSlamOperationRequest.swift
+@@ -71,7 +71,7 @@ extension GrandSlamOperationRequest {
+ 
+     func configure(request: inout HTTPRequest, anisetteData: AnisetteData) {
+         request.headerFields[.accept] = "*/*"
+-        request.headerFields[.userAgent] = DeviceInfo.akdUserAgent
++        request.headerFields[.userAgent] = anisetteData.deviceInfo.akdUserAgent
+     }
+ 
+     func method(anisetteData: AnisetteData) -> GrandSlamMethod {
+diff --git c/Sources/XKit/GrandSlam/Requests/GrandSlamTwoFactorRequest.swift i/Sources/XKit/GrandSlam/Requests/GrandSlamTwoFactorRequest.swift
+index 0329113..90a5472 100644
+--- c/Sources/XKit/GrandSlam/Requests/GrandSlamTwoFactorRequest.swift
++++ i/Sources/XKit/GrandSlam/Requests/GrandSlamTwoFactorRequest.swift
+@@ -20,7 +20,7 @@ extension GrandSlamTwoFactorRequest {
+     func configure(request: inout HTTPRequest, anisetteData: AnisetteData) {
+         request.headerFields[.accept] = "application/x-buddyml"
+         request.headerFields[.contentType] = "application/x-plist"
+-        request.headerFields[.userAgent] = DeviceInfo.akdUserAgent
++        request.headerFields[.userAgent] = anisetteData.deviceInfo.akdUserAgent
+         request.headerFields[.init("X-Apple-App-Info")!] = "com.apple.gs.xcode.auth"
+         request.headerFields[.init(DeviceInfo.xcodeVersionKey)!] = DeviceInfo.xcodeVersion
+         request.headerFields[.init("X-Apple-Identity-Token")!] = loginData.identityToken

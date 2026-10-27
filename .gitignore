@@ -1,0 +1,7 @@
+*.pem
+*.p8
+*.env
+!*.env.example
+/site.env
+rendered/
+/srv-gha/garm-provider-srv/garm-provider-srv

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Linux stand-in for xcodebuild: answers version and SDK queries only (CocoaPods,
+# React Native and Expo scripts ask them). Building goes through
+# `swift build --build-system swiftbuild` (expo-ios, xtool), never through here.
+set -euo pipefail
+SDKB=${DARWIN_SDK_BUNDLE:-/opt/swift-sdks/darwin.artifactbundle}
+# Xcode's version.plist, recorded by ios-sdk.sh from the .xip the SDK came from.
+VERSION_PLIST=${XCODE_VERSION_PLIST:-$(dirname "$SDKB")/Xcode.version.plist}
+[ -z "${XCRUN_SHIM_LOG:-}" ] || echo "xcodebuild $*" >>"$XCRUN_SHIM_LOG"
+
+xcode_version() {
+	if [ -f "$VERSION_PLIST" ]; then
+		python3 -c 'import plistlib,sys; p=plistlib.load(open(sys.argv[1],"rb")); print("Xcode", p["CFBundleShortVersionString"]); print("Build version", p["ProductBuildVersion"])' "$VERSION_PLIST"
+	else
+		echo "Xcode 27.1"
+		echo "Build version 0A0"
+	fi
+}
+sdk_dir() {
+	case "$1" in
+	iphonesimulator*) echo "$SDKB/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk" ;;
+	macosx*) echo "$SDKB/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk" ;;
+	*) echo "$SDKB/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk" ;;
+	esac
+}
+sdk_json() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$(sdk_dir "$1")/SDKSettings.json" "$2"; }
+
+sdk=
+action=${1:-}
+key=
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+	case "${args[i]}" in
+	-sdk) sdk=${args[i + 1]:-}; i=$((i + 1)) ;;
+	-version | -showsdks) action=${args[i]} ;;
+	-*) ;;
+	*) [ "$action" != -version ] || key=${args[i]} ;;
+	esac
+done
+case "$action" in
+-version)
+	if [ -z "$sdk" ]; then xcode_version; exit 0; fi
+	d=$(sdk_dir "$sdk")
+	[ -f "$d/SDKSettings.json" ] || { echo "xcodebuild: error: SDK \"$sdk\" cannot be located." >&2; exit 64; }
+	case "$key" in
+	Path) echo "$d" ;;
+	SDKVersion | PlatformVersion) sdk_json "$sdk" Version ;;
+	PlatformPath) echo "${d%/Developer/SDKs/*}" ;;
+	ProductBuildVersion) python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["ProductBuildVersion"])' "$d/System/Library/CoreServices/SystemVersion.plist" ;;
+	'') echo "$(basename "$d") - $(sdk_json "$sdk" DisplayName) ($sdk)"; echo "SDKVersion: $(sdk_json "$sdk" Version)"; echo "Path: $d" ;;
+	*) echo "xcodebuild: error: unknown SDK key $key (Linux stand-in)" >&2; exit 64 ;;
+	esac
+	;;
+-showsdks)
+	for s in iphoneos iphonesimulator macosx; do
+		d=$(sdk_dir "$s")
+		[ ! -f "$d/SDKSettings.json" ] || echo "	$(sdk_json "$s" DisplayName)	-sdk $s"
+	done
+	;;
+-find | -find-executable)
+	exec xcrun --find "${2:?}"
+	;;
+*)
+	echo "xcodebuild: not available on Linux (stand-in answers -version, -showsdks and -sdk X -version KEY). Build with expo-ios or swift build --build-system swiftbuild." >&2
+	exit 1
+	;;
+esac

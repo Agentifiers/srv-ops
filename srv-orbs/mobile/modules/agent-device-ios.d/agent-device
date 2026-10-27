@@ -1,0 +1,13 @@
+#!/bin/sh
+# agent-device with the host's USB iPhone (the phone broker) as its iOS device. Only agent-device
+# and the daemon it starts see /opt/agent-device-ios/bin, whose xcrun / xcodebuild / plutil stand
+# in for Xcode's (see agent-device-ios --help). Settings already in the environment win.
+PATH=/opt/agent-device-ios/bin:$PATH
+AGENT_DEVICE_IOS_BROKER=1
+: "${AGENT_DEVICE_IOS_RUNNER_APP_BUNDLE_ID:=@RUNNER_APP_ID@}"
+: "${AGENT_DEVICE_IOS_XCTESTRUN_FILE:=/opt/agent-device-ios/runner/AgentDeviceRunner.xctestrun}"
+: "${AGENT_DEVICE_IOS_XCTEST_DERIVED_DATA_PATH:=${AGENT_DEVICE_STATE_DIR:-$HOME/.agent-device}/ios-runner-derived}"
+: "${AGENT_DEVICE_IOS_XCTEST_ENV_DIR:=${AGENT_DEVICE_STATE_DIR:-$HOME/.agent-device}/ios-runner-env}"
+export PATH AGENT_DEVICE_IOS_BROKER AGENT_DEVICE_IOS_RUNNER_APP_BUNDLE_ID AGENT_DEVICE_IOS_XCTESTRUN_FILE \
+	AGENT_DEVICE_IOS_XCTEST_DERIVED_DATA_PATH AGENT_DEVICE_IOS_XCTEST_ENV_DIR
+exec /opt/agent-device/bin/agent-device.mjs "$@"

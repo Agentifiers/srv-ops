@@ -1,0 +1,143 @@
+--- a/ios/DevLauncherDevMenuDelegate.swift
++++ b/ios/DevLauncherDevMenuDelegate.swift
+@@ -17,10 +17,17 @@
+   }
+ 
+   public func devMenuSwitchToComponent(_ moduleName: String) -> Bool {
+-    return controller?.delegate?.switchAppRegistryComponent(to: moduleName) ?? false
++    return reactDelegateHandler?.switchAppRegistryComponent(to: moduleName) ?? false
+   }
+ 
+   public func devMenuCurrentComponentName() -> String? {
+-    return controller?.delegate?.rootViewModuleName
++    return reactDelegateHandler?.rootViewModuleName
++  }
++
++  // expo-ios (SwiftPM split): `EXDevLauncherController.delegate` is typed with the forward-declared
++  // Swift class ExpoDevLauncherReactDelegateHandler, which Swift can't import from the separate ObjC
++  // target, so the property is dropped from the Swift view; read it through KVC instead.
++  private var reactDelegateHandler: ExpoDevLauncherReactDelegateHandler? {
++    return controller?.value(forKey: "delegate") as? ExpoDevLauncherReactDelegateHandler
+   }
+ }
+--- a/ios/EXDevLauncher.m
++++ b/ios/EXDevLauncher.m
+@@ -6,8 +6,12 @@
+ #if __has_include(<EXDevLauncher/EXDevLauncher-Swift.h>)
+ // For cocoapods framework, the generated swift header will be inside EXDevLauncher module
+ #import <EXDevLauncher/EXDevLauncher-Swift.h>
++#elif __has_include(<EXDevLauncher-Swift.h>)
++#import <EXDevLauncher-Swift.h>
+ #else
+-#import <EXDevLauncher-Swift.h>
++// expo-ios (SwiftPM split): the Swift half is its own target, so its generated
++// header is reached as the EXDevLauncher module (same approach as expo's ExpoLoader).
++@import EXDevLauncher;
+ #endif
+ 
+ @implementation EXDevLauncher
+--- a/ios/EXDevLauncherController.h
++++ b/ios/EXDevLauncherController.h
+@@ -6,13 +6,19 @@
+ // Otherwise, it's available only locally with double-quoted imports.
+ #if __has_include(<EXUpdatesInterface/EXUpdatesInterface-Swift.h>)
+ #import <EXUpdatesInterface/EXUpdatesInterface-Swift.h>
+-#else
++#elif __has_include("EXUpdatesInterface-Swift.h")
+ #import "EXUpdatesInterface-Swift.h"
++#else
++// expo-ios (SwiftPM): no Swift header on the include path; import the Swift module.
++@import EXUpdatesInterface;
+ #endif
+ #if __has_include(<EXManifests/EXManifests-Swift.h>)
+ #import <EXManifests/EXManifests-Swift.h>
+-#else
++#elif __has_include("EXManifests-Swift.h")
+ #import "EXManifests-Swift.h"
++#else
++// expo-ios (SwiftPM): no Swift header on the include path; import the Swift module.
++@import EXManifests;
+ #endif
+ 
+ #if __has_include(<React-RCTAppDelegate/RCTAppDelegate.h>)
+--- a/ios/EXDevLauncherController.m
++++ b/ios/EXDevLauncherController.m
+@@ -13,13 +13,19 @@
+ #import <EXDevLauncher/EXDevLauncherUpdatesHelper.h>
+ 
+ 
+-#import <ReactAppDependencyProvider/RCTAppDependencyProvider.h>
++// expo-ios: RCTAppDependencyProvider is generated per app (ReactAppDependencyProvider
++// codegen) and linked into the app executable, not into the prebuilt EXDevLauncher
++// framework, so it is looked up at runtime instead of imported and linked here.
+ 
+ #if __has_include(<EXDevLauncher/EXDevLauncher-Swift.h>)
+ // For cocoapods framework, the generated swift header will be inside EXDevLauncher module
+ #import <EXDevLauncher/EXDevLauncher-Swift.h>
++#elif __has_include(<EXDevLauncher-Swift.h>)
++#import <EXDevLauncher-Swift.h>
+ #else
+-#import <EXDevLauncher-Swift.h>
++// expo-ios (SwiftPM split): the Swift half is its own target, so its generated
++// header is reached as the EXDevLauncher module (same approach as expo's ExpoLoader).
++@import EXDevLauncher;
+ #endif
+ 
+ @import EXManifests;
+@@ -77,7 +83,7 @@
+     self.installationIDHelper = [EXDevLauncherInstallationIDHelper new];
+     self.shouldPreferUpdatesInterfaceSourceUrl = NO;
+ 
+-    self.dependencyProvider = [RCTAppDependencyProvider new];
++    self.dependencyProvider = [NSClassFromString(@"RCTAppDependencyProvider") new];
+     self.devMenuDelegate = [[DevLauncherDevMenuDelegate alloc] initWithController:self];
+     [[DevMenuManager shared] setDelegate:self.devMenuDelegate];
+ 
+--- a/ios/Manifest/EXDevLauncherManifestParser.m
++++ b/ios/Manifest/EXDevLauncherManifestParser.m
+@@ -6,8 +6,12 @@
+ #if __has_include(<EXDevLauncher/EXDevLauncher-Swift.h>)
+ // For cocoapods framework, the generated swift header will be inside EXDevLauncher module
+ #import <EXDevLauncher/EXDevLauncher-Swift.h>
++#elif __has_include(<EXDevLauncher-Swift.h>)
++#import <EXDevLauncher-Swift.h>
+ #else
+-#import <EXDevLauncher-Swift.h>
++// expo-ios (SwiftPM split): the Swift half is its own target, so its generated
++// header is reached as the EXDevLauncher module (same approach as expo's ExpoLoader).
++@import EXDevLauncher;
+ #endif
+ 
+ @import EXManifests;
+--- a/ios/SwiftUI/DevLauncherViewModel.swift
++++ b/ios/SwiftUI/DevLauncherViewModel.swift
+@@ -189,7 +189,11 @@
+   }
+ 
+   func loadRecentlyOpenedApps() {
+-    let apps = EXDevLauncherController.sharedInstance().recentlyOpenedAppsRegistry.recentlyOpenedApps()
++    // expo-ios (SwiftPM split): the ObjC property is typed with a forward-declared Swift class, which
++    // Swift can't import from the separate ObjC target; read it through KVC instead.
++    let registry = EXDevLauncherController.sharedInstance()
++      .value(forKey: "recentlyOpenedAppsRegistry") as? EXDevLauncherRecentlyOpenedAppsRegistry
++    let apps = registry?.recentlyOpenedApps() ?? []
+ 
+     let allApps = apps.compactMap { app -> RecentlyOpenedApp? in
+       guard let url = app["url"] as? String,
+--- a/ios/SwiftUI/Utils/Utils.swift
++++ b/ios/SwiftUI/Utils/Utils.swift
+@@ -62,6 +62,14 @@
+     }
+   }
+ 
++  // expo-ios: the prebuilt EXDevLauncher.framework carries EXDevLauncher.bundle itself.
++  if let bundleURL = Bundle(for: DevLauncherBundleToken.self).url(forResource: "EXDevLauncher", withExtension: "bundle"),
++     let bundle = Bundle(url: bundleURL) {
++    return bundle
++  }
++
+   // fallback to the main bundle
+   return .main
+ }
++
++private final class DevLauncherBundleToken {}

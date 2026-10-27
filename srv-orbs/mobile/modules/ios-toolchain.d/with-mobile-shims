@@ -1,0 +1,11 @@
+#!/bin/sh
+# Run a build command with the macOS tool stand-ins (xcrun, xcodebuild, plutil,
+# otool, ...) first on PATH, as expo-ios does for its own steps:
+#   with-mobile-shims pod install
+# TAR_OPTIONS=--wildcards: CocoaPods' precompiled-module unpacking calls
+# /usr/bin/tar with bsdtar-style member globs.
+[ $# -gt 0 ] || { echo "usage: with-mobile-shims COMMAND [ARGS...]" >&2; exit 2; }
+PATH=${MOBILE_SHIMS_BIN:-/opt/mobile-shims/bin}:$PATH
+TAR_OPTIONS=${TAR_OPTIONS:---wildcards}
+export PATH TAR_OPTIONS
+exec "$@"

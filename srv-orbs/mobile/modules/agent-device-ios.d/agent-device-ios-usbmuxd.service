@@ -1,0 +1,8 @@
+[Unit]
+Description=usbmuxd look-alike for agent-device (the host's iPhone through the phone broker)
+Requires=agent-device-ios-usbmuxd.socket
+
+[Service]
+User=user
+ExecStart=/usr/local/bin/agent-device-ios usbmuxd
+Restart=on-failure

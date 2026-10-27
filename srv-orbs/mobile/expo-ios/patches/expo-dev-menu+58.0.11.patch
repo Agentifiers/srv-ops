@@ -1,0 +1,31 @@
+--- a/ios/EXDevMenuAppInfo.m
++++ b/ios/EXDevMenuAppInfo.m
+@@ -2,8 +2,12 @@
+ #import <EXDevMenu/EXDevMenuAppInfo.h>
+ #if __has_include(<EXDevMenu/EXDevMenu-Swift.h>)
+ #import <EXDevMenu/EXDevMenu-Swift.h>
++#elif __has_include(<EXDevMenu-Swift.h>)
++#import <EXDevMenu-Swift.h>
+ #else
+-#import <EXDevMenu-Swift.h>
++// expo-ios (SwiftPM split): the Swift half is its own target, so its generated
++// header is reached as the EXDevMenu module (same approach as expo's ExpoLoader).
++@import EXDevMenu;
+ #endif
+ 
+ @import EXManifests;
+--- a/ios/SwiftUI/DevMenuBundle.swift
++++ b/ios/SwiftUI/DevMenuBundle.swift
+@@ -7,5 +7,12 @@
+      let bundle = Bundle(url: bundleURL) {
+     return bundle
+   }
++  // expo-ios: the prebuilt EXDevMenu.framework carries EXDevMenu.bundle itself.
++  if let bundleURL = Bundle(for: DevMenuBundleToken.self).url(forResource: "EXDevMenu", withExtension: "bundle"),
++     let bundle = Bundle(url: bundleURL) {
++    return bundle
++  }
+   return .main
+ }
++
++private final class DevMenuBundleToken {}

@@ -1,0 +1,19 @@
+[Unit]
+Description=GARM GitHub Actions Runner Manager
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=garm
+Group=garm
+Environment=HOME=/var/lib/garm
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
+StateDirectory=garm
+StateDirectoryMode=0750
+ExecStart=/usr/local/bin/garm -config /etc/garm/config.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

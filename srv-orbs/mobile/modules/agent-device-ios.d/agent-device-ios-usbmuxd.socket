@@ -1,0 +1,9 @@
+[Unit]
+Description=usbmuxd look-alike for agent-device (the host's iPhone through the phone broker)
+
+[Socket]
+ListenStream=/run/usbmuxd
+SocketMode=0666
+
+[Install]
+WantedBy=sockets.target
