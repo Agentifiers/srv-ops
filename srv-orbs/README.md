@@ -46,10 +46,13 @@ guest boot ──> amp-orb-tailscale.service: amp orb id-token → tailscale up 
 | `../common/install-google-chrome.sh` | Run by both image builds; installs Google Chrome stable from Google's Debian repository after checking its SHA256. |
 | `agents/` | `/home/user/.config/agents/` (owned by `user`): pstack's generated skills, its Amp adapter `pstack/amp.md`, and `pstack/sync.ts` to regenerate them. |
 | `install.sh` | `render [DIR]` writes, `install` installs the providers' host files below (and the mobile provider's, see `mobile/README.md`), rendered from `site.env`. Existing env files keep their `AMP_ORB_PROVIDER_TOKEN` line. Nothing is enabled or restarted. |
-| `srv-orbs.env.example` | Template for `/etc/srv-orbs.env` (root, 0600): `SRV_HOST`, `ORB_IMAGE` and the per-orb shape `ORB_CPUS` / `ORB_RAM` / `ORB_DISK`. Add `AMP_ORB_PROVIDER_TOKEN` by hand. |
+| `srv-orbs.env.example` | Template for `/etc/srv-orbs.env` (root, 0600): `SRV_HOST`, `ORB_IMAGE`, the per-orb shape `ORB_CPUS` / `ORB_RAM` / `ORB_DISK` and `ORB_KEEPALIVE_HOURS`. Add `AMP_ORB_PROVIDER_TOKEN` by hand. |
 | `systemd/srv-orbs.service.d-coredump.conf` | `/etc/systemd/system/srv-orbs.service.d/coredump.conf`. The unit itself is upstream's `contrib/amp/orbs/srv-orbs.service`, which `install.sh` copies from `SRV_SRC_DIR`. |
+| `systemd/srv-orbs.service.d-keepalive.conf` | `/etc/systemd/system/srv-orbs.service.d/keepalive.conf`: dispatch through `srv-orb-keepalive` (see [Keep-alive](#keep-alive)). |
+| `keepalive/srv-orb-keepalive` | `/usr/local/bin/srv-orb-keepalive`, the dispatch program of both providers. |
+| `keepalive/srv-orb-keepalive-reap@.{service,timer}` | `/etc/systemd/system/`; enable one per provider: `srv-orb-keepalive-reap@srv-orbs.timer`, `srv-orb-keepalive-reap@srv-orbs-mobile.timer`. |
 
-The drop-in is needed because upstream's unit won't start when crash dumps are
+The coredump drop-in is needed because upstream's unit won't start when crash dumps are
 piped to a collector, such as `systemd-coredump`. The
 unit's `LimitCORE=0` still applies.
 
@@ -76,7 +79,8 @@ unmount any inspection mounts before orbs spawn.
 ```sh
 go build -o /tmp/srv-orb-dispatch "$SRV_SRC_DIR"/cmd/srv-orb-dispatch
 sudo install -m 0755 /tmp/srv-orb-dispatch /usr/local/bin/
-sudo ./install.sh install    # unit, drop-in and /etc/srv-orbs.env; then add AMP_ORB_PROVIDER_TOKEN
+sudo ./install.sh install    # units, drop-ins, keep-alive and /etc/srv-orbs.env; then add AMP_ORB_PROVIDER_TOKEN
+sudo systemctl enable --now srv-orb-keepalive-reap@srv-orbs.timer srv-orb-keepalive-reap@srv-orbs-mobile.timer
 ```
 
 - **Amp CLI:** installed for user `srv-orbs` (`/var/lib/srv-orbs/.amp`) and
@@ -85,6 +89,37 @@ sudo ./install.sh install    # unit, drop-in and /etc/srv-orbs.env; then add AMP
   identity. Its `known_hosts` contains srv's host key.
 - **State:** dispatcher state lives in `/var/lib/srv-orbs/dispatch`. Back it up
   together with srv's state. Never hand-edit it.
+
+## Keep-alive
+
+Amp pauses an orb after a few minutes without thread activity, even while a
+background command is still running, and upstream's `srv-orb-dispatch` answers
+a pause by stopping the microVM: terminals, dev servers, containers and
+anything else in memory are gone, and the next message cold-boots the orb.
+
+Both providers therefore dispatch through `srv-orb-keepalive`:
+
+- **Pause** (without a project snapshot) only records the time in
+  `$SRV_ORB_STATE_DIR-keepalive/` and leaves the VM running.
+- **Spawn** clears that record and runs `srv-orb-dispatch`, which finds the VM
+  running and restarts only Amp's bootstrap with the new token.
+- **Delete** and **snapshot pauses** go straight to `srv-orb-dispatch`
+  (a snapshot needs a stopped source).
+- **Reap:** every 10 minutes `srv-orb-keepalive-reap@<provider>.timer` really
+  pauses (stops) orbs that have been paused for `ORB_KEEPALIVE_HOURS`
+  (`SRV_ORB_KEEPALIVE_HOURS` in the provider env, default 24; `0` disables
+  keep-alive). `srv-orb-keepalive status` lists kept-alive orbs.
+
+Kept-alive orbs hold their full RAM (`ORB_RAM`, `MOBILE_ORB_RAM`) until reaped
+or deleted; size `ORB_KEEPALIVE_HOURS` to the host.
+
+Amp's headless agent runs inside `srv-orb-bootstrap.service`, and the guest
+agent restarts that unit (`KillMode=control-group`) on every spawn, so the
+agent's own shell and background commands, and anything they start directly
+(including a tmux server), still end on a wake. What survives: other systemd
+units and anything started with `sudo systemd-run`, Docker containers
+(redroid), Amp services (`.amp/services.yaml`), `/tmp`, page cache and the
+orb's tailnet node and IP.
 
 ## Tailscale
 

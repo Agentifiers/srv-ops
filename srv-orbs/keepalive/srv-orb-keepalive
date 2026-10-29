@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Keep-alive wrapper around srv's srv-orb-dispatch for `amp orb provider`.
+#
+# Amp pauses an orb after a few minutes without thread activity, even while a
+# background command is still running, and a pause stops the microVM: every
+# process, terminal, dev server and container in it is lost. This wrapper turns
+# Amp's plain pause into a no-op so the VM keeps running; the next spawn finds it
+# running and srv-orb-dispatch only restarts Amp's bootstrap with the fresh
+# token. Orbs left "paused" for SRV_ORB_KEEPALIVE_HOURS are then really stopped
+# by `srv-orb-keepalive reap` (run from a timer) through srv-orb-dispatch.
+#
+#   amp orb provider /usr/local/bin/srv-orb-keepalive   # dispatch program
+#   srv-orb-keepalive reap                              # stop orbs idle too long
+#   srv-orb-keepalive status                            # list kept-alive orbs
+#
+# Passed through unchanged: spawn, delete, and pauses that save a project
+# snapshot (ORB_SNAPSHOT_ID set; srv needs a stopped source for those).
+#
+# Environment (the provider's env file):
+#   SRV_ORB_STATE_DIR         srv-orb-dispatch state dir (required)
+#   SRV_ORB_KEEPALIVE_HOURS   hours to keep a paused orb running (default 24;
+#                             0 = no keep-alive, every pause stops the VM)
+#   SRV_ORB_KEEPALIVE_DIR     marker dir (default "$SRV_ORB_STATE_DIR-keepalive")
+#   SRV_ORB_DISPATCH          real dispatcher (default /usr/local/bin/srv-orb-dispatch)
+set -euo pipefail
+
+REAL="${SRV_ORB_DISPATCH:-/usr/local/bin/srv-orb-dispatch}"
+HOURS="${SRV_ORB_KEEPALIVE_HOURS:-24}"
+: "${SRV_ORB_STATE_DIR:?SRV_ORB_STATE_DIR is not set}"
+DIR="${SRV_ORB_KEEPALIVE_DIR:-${SRV_ORB_STATE_DIR%/}-keepalive}"
+
+log() { printf 'srv-orb-keepalive: %s\n' "$*" >&2; }
+
+[[ $HOURS =~ ^[0-9]+$ ]] || { log "SRV_ORB_KEEPALIVE_HOURS must be a whole number, got '$HOURS'"; exit 2; }
+umask 077
+mkdir -p "$DIR"
+
+key() { printf '%s' "$1" | sha256sum | cut -c1-32; }
+
+# lock ORB_ID: take this orb's wrapper lock on fd 9 (inherited by an exec'd dispatcher).
+lock() {
+	exec 9>"$DIR/$(key "$1").lock"
+	flock 9
+}
+
+dispatch() {
+	local id="${ORB_ID:?ORB_ID is not set}" op="${ORB_OPERATION:?ORB_OPERATION is not set}"
+	local marker
+	marker="$DIR/$(key "$id").paused"
+	lock "$id"
+	if [[ $op == pause && -z ${ORB_SNAPSHOT_ID:-} && $HOURS -gt 0 ]]; then
+		printf '%s %s\n' "$(date +%s)" "$id" >"$marker.tmp"
+		mv "$marker.tmp" "$marker"
+		log "pause $id: keeping the VM running (stopped after ${HOURS}h without a spawn)"
+		exit 0
+	fi
+	rm -f "$marker"
+	exec "$REAL" "$@"
+}
+
+reap() {
+	local now marker since id rc
+	now="$(date +%s)"
+	shopt -s nullglob
+	for marker in "$DIR"/*.paused; do
+		read -r since id <"$marker" || continue
+		((now - since >= HOURS * 3600)) || continue
+		(
+			lock "$id"
+			# Re-check under the lock: a spawn may have woken the orb meanwhile.
+			[[ -f $marker ]] || exit 0
+			read -r since id <"$marker"
+			((now - since >= HOURS * 3600)) || exit 0
+			log "pause $id: idle since $(date -d "@$since" --iso-8601=seconds); stopping the VM"
+			rc=0
+			env -u ORB_SNAPSHOT_ID -u ORB_TOKEN ORB_OPERATION=pause ORB_ID="$id" "$REAL" || rc=$?
+			if ((rc == 0)); then
+				rm -f "$marker"
+			else
+				log "pause $id: srv-orb-dispatch failed (exit $rc); will retry"
+			fi
+		)
+	done
+}
+
+status() {
+	local now marker since id
+	now="$(date +%s)"
+	shopt -s nullglob
+	for marker in "$DIR"/*.paused; do
+		read -r since id <"$marker" || continue
+		printf '%s  paused-by-amp %s ago, stop in %s\n' "$id" \
+			"$(((now - since) / 60))m" "$(((HOURS * 3600 - (now - since)) / 60))m"
+	done
+}
+
+case "${1:-}" in
+reap) reap ;;
+status) status ;;
+"") dispatch "$@" ;;
+*) log "usage: $0 [reap|status] (no argument: dispatch program for amp orb provider)"; exit 2 ;;
+esac

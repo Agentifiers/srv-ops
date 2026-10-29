@@ -5,7 +5,8 @@
 #                               env files there carry no provider token
 #   sudo ./install.sh install   install the units, drop-ins and env files of the
 #                               default (srv-orbs) and mobile (srv-orbs-mobile)
-#                               providers; an existing env file keeps its
+#                               providers, the keep-alive dispatch wrapper and
+#                               its reap timers; an existing env file keeps its
 #                               AMP_ORB_PROVIDER_TOKEN line
 #
 # srv-orbs.service itself is upstream's contrib/amp/orbs/srv-orbs.service from
@@ -16,7 +17,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../common/site-env.sh
 . "$HERE/../common/site-env.sh"
 site_env_load SRV_SRC_DIR SRV_HOST ORB_IMAGE ORB_CPUS ORB_RAM ORB_DISK \
-	MOBILE_ORB_IMAGE MOBILE_ORB_CPUS MOBILE_ORB_RAM MOBILE_ORB_DISK
+	MOBILE_ORB_IMAGE MOBILE_ORB_CPUS MOBILE_ORB_RAM MOBILE_ORB_DISK ORB_KEEPALIVE_HOURS
 
 UPSTREAM_UNIT="$SRV_SRC_DIR/contrib/amp/orbs/srv-orbs.service"
 
@@ -37,6 +38,9 @@ render_all() { # render_all DIR [ETC]
 	mkdir -p "$dir"
 	install -m 0644 "$UPSTREAM_UNIT" "$dir/srv-orbs.service"
 	install -m 0644 "$HERE/systemd/srv-orbs.service.d-coredump.conf" "$dir/srv-orbs.coredump.conf"
+	install -m 0644 "$HERE/systemd/srv-orbs.service.d-keepalive.conf" "$dir/srv-orbs.keepalive.conf"
+	install -m 0755 "$HERE/keepalive/srv-orb-keepalive" "$dir/srv-orb-keepalive"
+	install -m 0644 "$HERE/keepalive/srv-orb-keepalive-reap@.service" "$HERE/keepalive/srv-orb-keepalive-reap@.timer" "$dir/"
 	install -m 0644 "$HERE/mobile/systemd/srv-orbs-mobile.service" "$dir/srv-orbs-mobile.service"
 	install -m 0644 "$HERE/mobile/systemd/srv-orbs-mobile.service.d-coredump.conf" "$dir/srv-orbs-mobile.coredump.conf"
 	(
@@ -56,15 +60,19 @@ install)
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' EXIT
 	render_all "$tmp" /etc
-	install -m 0644 "$tmp/srv-orbs.service" "$tmp/srv-orbs-mobile.service" /etc/systemd/system/
+	install -m 0644 "$tmp/srv-orbs.service" "$tmp/srv-orbs-mobile.service" \
+		"$tmp/srv-orb-keepalive-reap@.service" "$tmp/srv-orb-keepalive-reap@.timer" /etc/systemd/system/
 	install -D -m 0644 "$tmp/srv-orbs.coredump.conf" /etc/systemd/system/srv-orbs.service.d/coredump.conf
+	install -D -m 0644 "$tmp/srv-orbs.keepalive.conf" /etc/systemd/system/srv-orbs.service.d/keepalive.conf
 	install -D -m 0644 "$tmp/srv-orbs-mobile.coredump.conf" /etc/systemd/system/srv-orbs-mobile.service.d/coredump.conf
+	install -m 0755 "$tmp/srv-orb-keepalive" /usr/local/bin/srv-orb-keepalive
 	for env in srv-orbs srv-orbs-mobile; do
 		install -m 0600 -o root -g root "$tmp/$env.env" "/etc/$env.env"
 		grep -q '^AMP_ORB_PROVIDER_TOKEN=' "/etc/$env.env" || echo "add AMP_ORB_PROVIDER_TOKEN to /etc/$env.env"
 	done
 	systemctl daemon-reload
-	echo "installed; restart srv-orbs/srv-orbs-mobile to apply"
+	echo "installed; restart srv-orbs/srv-orbs-mobile to apply, and enable"
+	echo "srv-orb-keepalive-reap@srv-orbs.timer and srv-orb-keepalive-reap@srv-orbs-mobile.timer"
 	;;
 *)
 	echo "usage: $0 render [DIR] | install" >&2

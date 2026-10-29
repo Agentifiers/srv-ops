@@ -1,0 +1,9 @@
+[Unit]
+Description=Stop %i orbs kept running past SRV_ORB_KEEPALIVE_HOURS
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
