@@ -106,20 +106,28 @@ Both providers therefore dispatch through `srv-orb-keepalive`:
 - **Delete** and **snapshot pauses** go straight to `srv-orb-dispatch`
   (a snapshot needs a stopped source).
 - **Reap:** every 10 minutes `srv-orb-keepalive-reap@<provider>.timer` really
-  pauses (stops) orbs that have been paused for `ORB_KEEPALIVE_HOURS`
+  pauses (stops) orbs whose last pause is `ORB_KEEPALIVE_HOURS` old
   (`SRV_ORB_KEEPALIVE_HOURS` in the provider env, default 24; `0` disables
   keep-alive). `srv-orb-keepalive status` lists kept-alive orbs.
 
 Kept-alive orbs hold their full RAM (`ORB_RAM`, `MOBILE_ORB_RAM`) until reaped
 or deleted; size `ORB_KEEPALIVE_HOURS` to the host.
 
-Amp's headless agent runs inside `srv-orb-bootstrap.service`, and the guest
-agent restarts that unit (`KillMode=control-group`) on every spawn, so the
-agent's own shell and background commands, and anything they start directly
-(including a tmux server), still end on a wake. What survives: other systemd
-units and anything started with `sudo systemd-run`, Docker containers
-(redroid), Amp services (`.amp/services.yaml`), `/tmp`, page cache and the
-orb's tailnet node and IP.
+Every idle stretch of a few minutes makes Amp send another pause, which
+restarts the clock. The host cannot see thread activity itself (CPU and
+network of an orb waiting on the model look idle), so a thread that works
+without any such gap for `ORB_KEEPALIVE_HOURS` after its last pause is still
+stopped by the reaper.
+
+Amp's headless agent runs inside `srv-orb-bootstrap.service`. While the VM
+keeps running, Amp usually wakes a paused thread through that still-connected
+agent without sending a spawn, so its shells and background commands survive
+too. A spawn makes the guest agent restart the unit
+(`KillMode=control-group`), which ends the agent's shells and anything they
+started directly (including a tmux server); other systemd units, `sudo
+systemd-run` jobs, Docker containers (redroid), Amp services
+(`.amp/services.yaml`), `/tmp` and the orb's tailnet node and IP survive even
+that.
 
 ## Tailscale
 
