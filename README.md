@@ -40,11 +40,17 @@ if a value they need is missing. Secrets never go in `site.env` or the repo.
   quarantined until the host reboots.
 - **`SRV_GUEST_AUTH_TAGS=tag:gha`.** Orbs don't use srv-minted keys, so this
   default tag applies only to CI and hand-made VMs.
-- **Firewall** (ufw example; srv's default VM network is `172.28.0.0/16`):
+- **Firewall** (ufw example): match srv's VM tap devices by interface, not the
+  VM network by address:
   ```sh
-  sudo ufw allow proto tcp from 172.28.0.0/16 to 172.28.0.0/16 port 3128   # Amp CONNECT gateway (orb bootstrap)
-  sudo ufw route allow from 172.28.0.0/16                                   # VM egress, matches srv's FORWARD accept
+  sudo ufw allow in on tap+ from 0.0.0.0/0 to any port 3128 proto tcp   # Amp CONNECT gateway (orb bootstrap)
+  sudo ufw route allow in on tap+ from 0.0.0.0/0                        # VM egress, matches srv's FORWARD accept
   ```
+  Never write a host rule or route containing the first addresses of the VM
+  network (e.g. `172.28.0.0/16`). Before deleting an orb, srv checks that its
+  `/30` appears nowhere in `ip`, `iptables`/`nft` output. A rule naming
+  `172.28.0.0` makes every orb on `172.28.0.0/30` fail that check; it then
+  stays `deleting` and needs manual reconciliation.
 - **Dirty-page caps:** `host/sysctl/99-srv-dirty.conf` → `/etc/sysctl.d/`
   (1 GiB background / 4 GiB). Small desktop defaults throttle Firecracker I/O
   when several VMs write at once.

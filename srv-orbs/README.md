@@ -155,10 +155,10 @@ Shell in with `ssh root@amp-<thread-id>`.
 
 ## Host requirements this depends on
 
-- **ufw allows the Amp CONNECT gateway** (`$SRV_VM_NETWORK_CIDR →
-  $SRV_VM_NETWORK_CIDR tcp/$SRV_AMP_CONNECT_GATEWAY_PORT`, default
-  `172.28.0.0/16`, port 3128) and routed VM egress. Without the gateway rule,
-  `amp orb bootstrap` times out and the orb never connects.
+- **ufw allows the Amp CONNECT gateway** (tcp/`$SRV_AMP_CONNECT_GATEWAY_PORT`,
+  default 3128, in on `tap+`) and routed VM egress; see the top-level README
+  for the rules. Without the gateway rule, `amp orb bootstrap` times out and
+  the orb never connects.
 - **A short `SRV_JAILER_BASE_DIR`** (default `/srv/jail`, set in srv's
   `srv.env`). Dispatcher VM names are 60 characters, and under srv's default
   `/var/lib/srv/jailer` the Firecracker API socket path (114 bytes) is longer
