@@ -17,7 +17,7 @@ name prefixes, so neither can disturb the other.
 | `srv-orbs/mobile/` | `amp-orb-mobile` and its provider: a `-mobile` guest kernel (binder, ashmem, dma-buf heaps, extra netfilter, PSI) and an image with Android (SDK, redroid, expo-device-hub, agent-device) and iOS (Swift 6.4, xtool, Darwin SDK from your Xcode .xip, pymobiledevice3, `expo-ios`) tooling. Expo/React Native iOS apps build in the orb on Linux. See `srv-orbs/mobile/README.md`. |
 | `srv-mobile-host/` | A USB-attached iPhone shared by mobile orbs: `pmd3-tunneld` and `iphone-broker` (exclusive leases over the tailnet, development signing, install, launch, screenshots, HID input, logs, port forwards). See `srv-mobile-host/README.md`. |
 | `srv-gha/` | Ephemeral GitHub Actions runners: GARM config, the `garm-provider-srv` adapter, the `gha-runner` image builder, and the GARM and bazel-remote units. See `srv-gha/README.md`. |
-| `host/` | srv's `images.json`, an `srv.env` template, local srv patches and host sysctl settings. |
+| `host/` | srv's `images.json`, an `srv.env` template and host sysctl settings. |
 
 ## Configure
 
@@ -58,23 +58,15 @@ if a value they need is missing. Secrets never go in `site.env` or the repo.
   latency:
   `sudo cryptsetup refresh --perf-no_read_workqueue --perf-no_write_workqueue --persistent <mapping>`
 
-## srv patches
+## srv version
 
-`host/srv/patches/` holds fixes this setup needs that upstream srv doesn't
-have yet. Apply them to the checkout in `SRV_SRC_DIR` before building srv:
-
-```sh
-host/srv/apply-patches.sh --check   # already applied / would apply / does not apply
-host/srv/apply-patches.sh
-cd "$SRV_SRC_DIR" && sudo ./contrib/systemd/install.sh
-```
-
-| Patch | Why | Upstream |
-|---|---|---|
-| `0001-keep-empty-machine-id-in-project-templates.patch` | srv's project-template sanitizer deletes `/etc/machine-id`, so every Orb cloned from a project snapshot boots as a systemd "first boot", enables `systemd-networkd-wait-online`, stalls up to two minutes and misses its first bootstrap. The patch leaves an empty, root-owned 0444 file instead (fresh transient ID per boot, no first-boot semantics). | [HeavyHorst/srv#8](https://github.com/HeavyHorst/srv/pull/8) |
-
-Delete a patch once upstream has merged it; `apply-patches.sh` then reports
-it as not applying (or already applied) on the new revision.
+Build srv from upstream `main` at or after `7571b22` (the merge of
+[HeavyHorst/srv#8](https://github.com/HeavyHorst/srv/pull/8)). Older revisions
+delete `/etc/machine-id` from project templates, so every Orb cloned from a
+project snapshot boots as a systemd "first boot", enables
+`systemd-networkd-wait-online`, stalls up to two minutes and misses its first
+bootstrap. Install it with `sudo ./contrib/systemd/install.sh` in
+`SRV_SRC_DIR`.
 
 ## Backups
 
