@@ -18,6 +18,8 @@ site_env_load SITE_HOST_TAILNET_IP BAZEL_REMOTE_GRPC_PORT SRV_IMAGES_DIR GHA_RUN
 BASE_DIR="${BASE_DIR:-$SRV_IMAGES_DIR/arch-base}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SRV_IMAGES_DIR/$GHA_RUNNER_IMAGE}"
 ROOTFS_SIZE="${ROOTFS_SIZE:-}"
+# Node versions pre-seeded into the runner's tool cache (comma or space separated).
+read -r -a NODE_VERSIONS <<<"${GHA_NODE_VERSIONS//,/ }"
 
 RUNNER_VERSION=2.338.1
 # From the release body ("BEGIN SHA linux-x64") and the asset digest of
@@ -47,6 +49,7 @@ PACKAGES=(
 mkdir -p "$OUTPUT_DIR"
 img="$OUTPUT_DIR/rootfs-base.img.new"
 tarball="$OUTPUT_DIR/actions-runner.tar.gz.new"
+node_dl="$OUTPUT_DIR/node-dist.new"
 mnt="$(mktemp -d)"
 udev_rule=/run/udev/rules.d/99-srv-image-no-automount.rules
 
@@ -60,7 +63,7 @@ cleanup() {
 		umount -R "$mnt" || { echo "failed to unmount $mnt; leaving it in place" >&2; exit 1; }
 	fi
 	rmdir "$mnt"
-	rm -f "$udev_rule" "$tarball"
+	rm -rf "$udev_rule" "$tarball" "$node_dl"
 	udevadm control --reload
 	[[ $status == 0 ]] || rm -f "$img" "$OUTPUT_DIR/manifest.txt.new"
 	exit "$status"
@@ -71,6 +74,19 @@ trap cleanup EXIT
 curl -fsSL "$RUNNER_URL" -o "$tarball"
 echo "$RUNNER_SHA256  $tarball" | sha256sum -c --quiet - \
 	|| { echo "sha256 mismatch for $RUNNER_URL" >&2; exit 1; }
+
+# actions/setup-node finds an exact version in the runner's tool cache and then
+# skips its download, so a stalled CDN request can no longer hang the step.
+# The official tarballs are verified against nodejs.org's SHASUMS256.txt.
+mkdir -p "$node_dl"
+for v in "${NODE_VERSIONS[@]}"; do
+	[[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "GHA_NODE_VERSIONS: '$v' is not an exact version" >&2; exit 1; }
+	f="node-v$v-linux-x64.tar.xz"
+	curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 "https://nodejs.org/dist/v$v/$f" -o "$node_dl/$f"
+	curl -fsSL --retry 3 --connect-timeout 20 --max-time 60 "https://nodejs.org/dist/v$v/SHASUMS256.txt" -o "$node_dl/SHASUMS256-$v.txt"
+	(cd "$node_dl" && grep -E "^[0-9a-f]{64}  $f\$" "SHASUMS256-$v.txt" | sha256sum -c --quiet --strict -) \
+		|| { echo "sha256 mismatch for $f" >&2; exit 1; }
+done
 
 # Keep desktop automounters (udisks) off the loop device while we write to it.
 mkdir -p "$(dirname "$udev_rule")"
@@ -117,6 +133,18 @@ install -d -o "$RUNNER_UID" -g "$RUNNER_UID" "$mnt/home/runner/actions-runner"
 tar -xzf "$tarball" -C "$mnt/home/runner/actions-runner"
 chown -R "$RUNNER_UID:$RUNNER_UID" "$mnt/home/runner/actions-runner"
 
+# @actions/tool-cache layout under the runner's default work folder:
+# _work/_tool/node/<version>/x64/ plus the x64.complete marker.
+toolcache="$mnt/home/runner/actions-runner/_work/_tool"
+for v in "${NODE_VERSIONS[@]}"; do
+	install -d "$toolcache/node/$v/x64"
+	tar -xJf "$node_dl/node-v$v-linux-x64.tar.xz" -C "$toolcache/node/$v/x64" --strip-components=1 --no-same-owner
+	touch "$toolcache/node/$v/x64.complete"
+done
+if ((${#NODE_VERSIONS[@]})); then
+	chown -R "$RUNNER_UID:$RUNNER_UID" "$mnt/home/runner/actions-runner/_work"
+fi
+
 # Read-only remote cache by default; workflows opt into uploads with
 # credentials (--remote_upload_local_results plus a credentialed URL).
 cat > "$mnt/etc/bazel.bazelrc" <<EOF
@@ -149,6 +177,7 @@ fi
 	echo "bazelisk=$bazelisk_version"
 	echo "gh=$(arch-chroot "$mnt" gh --version | head -1)"
 	echo "node=$(arch-chroot "$mnt" node --version)"
+	echo "node_toolcache=${NODE_VERSIONS[*]:-none}"
 	echo "aws=$(arch-chroot "$mnt" aws --version)"
 	echo "chrome=$chrome_version"
 	echo "packages=$(IFS=,; echo "${PACKAGES[*]}")"
