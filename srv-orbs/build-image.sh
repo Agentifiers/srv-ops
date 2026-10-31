@@ -36,6 +36,8 @@ PACKAGES=(
 	# and Xvfb for headed browser tests outside the Wayland Desktop (xvfb-run).
 	alsa-lib gtk3 libcups libxss libxtst nss ttf-liberation xdg-utils
 	xorg-server-xvfb
+	# agent-desktop's clipboard commands on the Wayland Desktop.
+	wl-clipboard
 )
 
 # AWS SDK for JavaScript v3, installed globally. CommonJS require() finds it
@@ -49,12 +51,23 @@ AWS_SDK_PACKAGES=(
 	@aws-sdk/client-cloudwatch-logs @aws-sdk/credential-providers
 )
 
+# agent-desktop with the wlroots route (Amp's Desktop runs labwc), from the
+# Agentifiers fork's release; the archive matches upstream's layout. SKILL.md is
+# the agent-desktop skill at the same commit; guest/agent-desktop-orb.md is
+# appended to it.
+AGENT_DESKTOP_VERSION=1.0.2-wlroots.2
+AGENT_DESKTOP_RELEASE="https://github.com/Agentifiers/agent-desktop/releases/download/v$AGENT_DESKTOP_VERSION"
+AGENT_DESKTOP_ARCHIVE="agent-desktop-v$AGENT_DESKTOP_VERSION-x86_64-unknown-linux-gnu.tar.gz"
+AGENT_DESKTOP_SHA256=c39264e21dd19795820de68f68140f119ca8f9bd23ca79eee3ab5b6ceaa8a488
+AGENT_DESKTOP_SKILL_SHA256=359140fc5ede5ba29c54c24b4bb4eae374f65ecc883a83404cb7f96dc5edc3b9
+
 [[ $(id -u) == 0 ]] || { echo "run as root" >&2; exit 1; }
 grep -qx 'srv_amp_orb=1' "$BASE_DIR/manifest.txt" || { echo "$BASE_DIR is not an SRV_AMP_ORB=1 build" >&2; exit 1; }
 
 mkdir -p "$OUTPUT_DIR"
 img="$OUTPUT_DIR/rootfs-base.img.new"
 mnt="$(mktemp -d)"
+downloads="$OUTPUT_DIR/downloads.new"
 udev_rule=/run/udev/rules.d/99-srv-image-no-automount.rules
 
 cleanup() {
@@ -67,12 +80,20 @@ cleanup() {
 		umount -R "$mnt" || { echo "failed to unmount $mnt; leaving it in place" >&2; exit 1; }
 	fi
 	rmdir "$mnt"
-	rm -f "$udev_rule"
+	rm -rf "$udev_rule" "$downloads"
 	udevadm control --reload
 	[[ $status == 0 ]] || rm -f "$img"
 	exit "$status"
 }
 trap cleanup EXIT
+
+# Fetch and verify agent-desktop before touching the image.
+mkdir -p "$downloads"
+curl -fsSL --retry 3 "$AGENT_DESKTOP_RELEASE/$AGENT_DESKTOP_ARCHIVE" -o "$downloads/agent-desktop.tar.gz"
+curl -fsSL --retry 3 "$AGENT_DESKTOP_RELEASE/SKILL.md" -o "$downloads/agent-desktop-SKILL.md"
+printf '%s  %s\n' "$AGENT_DESKTOP_SHA256" "$downloads/agent-desktop.tar.gz" \
+	"$AGENT_DESKTOP_SKILL_SHA256" "$downloads/agent-desktop-SKILL.md" | sha256sum -c --quiet - \
+	|| { echo "sha256 mismatch for agent-desktop $AGENT_DESKTOP_VERSION" >&2; exit 1; }
 
 # Keep desktop automounters (udisks) off the loop device while we write to it.
 mkdir -p "$(dirname "$udev_rule")"
@@ -117,6 +138,26 @@ arch-chroot "$mnt" runuser -u user -- bash -c 'cd /tmp && agent-browser doctor' 
 rm -rf "$mnt/home/user/.agent-browser" "$mnt/home/user/.config/google-chrome"
 agent_browser_version="$(arch-chroot "$mnt" runuser -u user -- agent-browser --version)"
 
+# agent-desktop: the CLI and its clipboard helper side by side in /opt, the
+# session wrapper on PATH, and labwc session hooks that turn accessibility on
+# for Amp's Desktop (Amp writes only ~/.config/labwc/rc.xml, so labwc reads
+# environment and autostart from /etc/xdg/labwc).
+install -d -m 0755 "$mnt/opt/agent-desktop"
+tar -xzf "$downloads/agent-desktop.tar.gz" -C "$mnt/opt/agent-desktop" --no-same-owner
+chmod 0755 "$mnt/opt/agent-desktop/agent-desktop" "$mnt/opt/agent-desktop/agent-desktop-linux-clipboard-owner"
+install -m 0755 "$HERE/guest/agent-desktop" "$mnt/usr/local/bin/agent-desktop"
+install -D -m 0644 "$HERE/guest/labwc-environment" "$mnt/etc/xdg/labwc/environment"
+install -D -m 0644 "$HERE/guest/labwc-autostart" "$mnt/etc/xdg/labwc/autostart"
+install -D -m 0644 "$HERE/guest/amp-desktop-accessibility.conf" \
+	"$mnt/etc/systemd/system/run-.service.d/amp-desktop-accessibility.conf"
+skill_dir=/home/user/.config/agents/skills/agent-desktop
+install -d -m 0755 -o "${user_owner%:*}" -g "${user_owner#*:}" "$mnt$skill_dir"
+cat "$downloads/agent-desktop-SKILL.md" "$HERE/guest/agent-desktop-orb.md" \
+	| install -m 0644 -o "${user_owner%:*}" -g "${user_owner#*:}" /dev/stdin "$mnt$skill_dir/SKILL.md"
+agent_desktop_version="$(arch-chroot "$mnt" runuser -u user -- agent-desktop version | jq -r .data.version)"
+[[ $agent_desktop_version == "${AGENT_DESKTOP_VERSION%%-*}" ]] \
+	|| { echo "agent-desktop reports $agent_desktop_version, expected $AGENT_DESKTOP_VERSION" >&2; exit 1; }
+
 # pstack skills for every repository. agents/ mirrors ~/.config/agents/, so the
 # skills' relative links to pstack/amp.md resolve in the image.
 cp -r --no-preserve=ownership "$HERE/agents/." "$mnt/home/user/.config/agents/"
@@ -151,6 +192,7 @@ systemctl --root="$mnt" enable amp-orb-tailscale.service >/dev/null
 	echo "aws=$(arch-chroot "$mnt" aws --version)"
 	echo "chrome=$chrome_version"
 	echo "agent_browser=$agent_browser_version"
+	echo "agent_desktop=$AGENT_DESKTOP_VERSION"
 	echo "pstack=cursor/plugins@$pstack_revision"
 	echo "aws_sdk_js=$(arch-chroot "$mnt" npm ls -g --depth=0 @aws-sdk/client-s3 | grep -o 'client-s3@[0-9.]*')"
 	echo "packages=$(IFS=,; echo "${PACKAGES[*]}")"

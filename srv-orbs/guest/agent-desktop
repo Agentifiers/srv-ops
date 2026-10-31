@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# /usr/local/bin/agent-desktop: runs the real CLI (/opt/agent-desktop) inside
+# Amp's orb Desktop session from any shell.
+#
+# Amp's agent shell is not part of that session. Amp records its display and
+# runtime directory in ~/.cache/amp/desktop/environment but not the session's
+# D-Bus address, which agent-desktop needs to reach the AT-SPI accessibility
+# bus; that address is read from the session's compositor (labwc). A shell that
+# already has WAYLAND_DISPLAY or DISPLAY (for example a terminal opened on the
+# Desktop) is left as it is.
+set -euo pipefail
+
+real=/opt/agent-desktop/agent-desktop
+env_file="${HOME:-/home/user}/.cache/amp/desktop/environment"
+
+if [[ -z ${WAYLAND_DISPLAY:-}${DISPLAY:-} && -r $env_file ]]; then
+	# shellcheck source=/dev/null
+	. "$env_file"
+	pid="$(pgrep -u "$(id -u)" -x labwc | head -n1 || true)"
+	if [[ -n $pid ]]; then
+		bus="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -n1)"
+		[[ -n $bus ]] && export DBUS_SESSION_BUS_ADDRESS="$bus"
+	else
+		echo "agent-desktop: the orb Desktop is not running; open the Desktop tab in the thread (or run: sudo systemctl start amp-desktop)" >&2
+	fi
+fi
+
+exec "$real" "$@"

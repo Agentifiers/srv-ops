@@ -1,0 +1,28 @@
+# /etc/xdg/labwc/autostart: runs inside Amp's orb Desktop session.
+# - at-spi-bus-launcher starts with the accessibility bus disabled and, since
+#   at-spi2-core 2.62, never reads a default; enable it so toolkits register.
+# - Amp starts Desktop apps as transient systemd units without the session's
+#   D-Bus address, so they cannot ask for the accessibility bus. Link its socket
+#   to a fixed path, $XDG_RUNTIME_DIR/at-spi-bus, which the unit drop-in
+#   run-.service.d/amp-desktop-accessibility.conf hands them as AT_SPI_BUS_ADDRESS.
+# - Xwayland clients find the bus through the AT_SPI_BUS root-window property,
+#   which the launcher sets only when X is up as it starts, so publish it once
+#   Xwayland answers (xsettingsd keeps it running for the whole session).
+(
+	enabled=
+	for _ in $(seq 50); do
+		busctl --user set-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled b true
+		enabled="$(busctl --user get-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled)"
+		[ "$enabled" = 'b true' ] && break
+		sleep 0.2
+	done
+	address="$(busctl --user call org.a11y.Bus /org/a11y/bus org.a11y.Bus GetAddress | sed -n 's/^s "\(.*\)"$/\1/p')"
+	socket="${address#unix:path=}"
+	socket="${socket%%,*}"
+	[ -S "$socket" ] && ln -sfn "$socket" "$XDG_RUNTIME_DIR/at-spi-bus"
+	for _ in $(seq 100); do
+		xprop -root -len 0 >/dev/null 2>&1 && break
+		sleep 0.1
+	done
+	[ -n "$address" ] && xprop -root -f AT_SPI_BUS 8s -set AT_SPI_BUS "$address"
+) >/dev/null 2>&1 &

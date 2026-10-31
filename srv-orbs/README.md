@@ -43,6 +43,8 @@ guest boot ──> amp-orb-tailscale.service: amp orb id-token → tailscale up 
 | `build-image.sh` | Layer build. It turns `$SRV_IMAGES_DIR/$ORB_IMAGE-base` into `$SRV_IMAGES_DIR/$ORB_IMAGE` (`ORB_IMAGE` defaults to `amp-orb`). |
 | `guest/amp-orb-tailscale{,.service}`, `guest/tailscaled-mem-state.conf` | Baked into the image by `build-image.sh`. |
 | `guest/amp-orb-tailscale.env.example` | Template for `/etc/amp-orb-tailscale.env` in the image; `build-image.sh` renders it from `site.env` (`AMP_WORKSPACE_ID`, `ORB_TAILSCALE_*`). |
+| `guest/agent-desktop`, `guest/agent-desktop-orb.md` | `/usr/local/bin/agent-desktop` (runs the CLI from `/opt/agent-desktop` inside the Desktop session) and the orb section appended to the `agent-desktop` skill. See [Desktop and computer use](#desktop-and-computer-use). |
+| `guest/labwc-{environment,autostart}`, `guest/amp-desktop-accessibility.conf` | `/etc/xdg/labwc/{environment,autostart}` and `/etc/systemd/system/run-.service.d/amp-desktop-accessibility.conf`: accessibility for the Desktop session and the apps Amp launches in it. |
 | `../common/install-google-chrome.sh` | Run by both image builds; installs Google Chrome stable from Google's Debian repository after checking its SHA256. |
 | `agents/` | `/home/user/.config/agents/` (owned by `user`): pstack's generated skills, its Amp adapter `pstack/amp.md`, and `pstack/sync.ts` to regenerate them. |
 | `install.sh` | `render [DIR]` writes, `install` installs the providers' host files below (and the mobile provider's, see `mobile/README.md`), rendered from `site.env`. Existing env files keep their `AMP_ORB_PROVIDER_TOKEN` line. Nothing is enabled or restarted. |
@@ -128,6 +130,38 @@ started directly (including a tmux server); other systemd units, `sudo
 systemd-run` jobs, Docker containers (redroid), Amp services
 (`.amp/services.yaml`), `/tmp` and the orb's tailnet node and IP survive even
 that.
+
+## Desktop and computer use
+
+Every thread's orb has Amp's Desktop (the thread's **Desktop** tab): srv's orb
+base bakes Amp's Wayland stack (`/opt/amp-wayland`: labwc 0.9.8 and waymote),
+and Amp installs `/opt/amp-desktop` and `amp-desktop.service` the first time
+the tab opens.
+
+Agents operate it with [agent-desktop](https://github.com/vercel-labs/agent-desktop)
+from the [Agentifiers fork](https://github.com/Agentifiers/agent-desktop), whose
+Linux backend adds a wlroots route (virtual keyboard and pointer, screencopy,
+foreign-toplevel). `build-image.sh` installs a pinned release
+(`AGENT_DESKTOP_VERSION`, archive and skill checked by SHA-256) and the skill,
+with an orb section from `guest/agent-desktop-orb.md`.
+
+- **Session environment:** Amp's agent shell is outside the Desktop session.
+  `/usr/local/bin/agent-desktop` loads `~/.cache/amp/desktop/environment` and
+  the session's D-Bus address (read from labwc), so `agent-desktop ...` works
+  from any shell while the Desktop is running.
+- **Accessibility on:** at-spi2-core 2.62 starts the accessibility bus
+  disabled and ignores any default. labwc's system `autostart` (Amp writes only
+  `~/.config/labwc/rc.xml`) enables it, links the bus socket to
+  `$XDG_RUNTIME_DIR/at-spi-bus` and publishes `AT_SPI_BUS` for Xwayland apps.
+  labwc's `environment` sets `ACCESSIBILITY_ENABLED=1` and
+  `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1` for apps it starts.
+- **Apps Amp launches** (`/opt/amp-desktop/launch-app`, including the
+  Desktop's Chrome) run as transient `systemd-run` units with a fixed
+  environment and no session bus. The `run-.service.d` prefix drop-in gives
+  every transient unit those two variables plus `AT_SPI_BUS_ADDRESS` pointing
+  at the linked socket.
+- **Web pages** stay with agent-browser over the Desktop Chrome's DevTools
+  port (`127.0.0.1:9222`); agent-desktop is for native apps and window control.
 
 ## Tailscale
 

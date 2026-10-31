@@ -1,0 +1,6 @@
+# /etc/xdg/labwc/environment: read by labwc on Amp's orb Desktop (Amp only
+# writes ~/.config/labwc/rc.xml) and passed to every app it starts. Chrome and
+# Qt otherwise expose their accessibility trees only when an assistive
+# technology is detected at startup; agent-desktop reads those trees.
+ACCESSIBILITY_ENABLED=1
+QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
