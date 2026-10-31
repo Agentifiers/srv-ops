@@ -11,6 +11,13 @@ yourself.
   empty `supported_surfaces`, the Desktop is not running: ask the user to open
   the Desktop tab, or run `sudo systemctl start amp-desktop` when
   `/opt/amp-desktop` exists. The user watches what you do there.
+- **The user sees your cursor.** Unless you pass `--session` or set
+  `AGENT_DESKTOP_SESSION`, the wrapper runs every command in one agent-desktop
+  session per Desktop run, started with `--cursor`: pointer actions and proven
+  ref actions glide a visible dart there, clicks ripple, and the action label
+  shows next to it. Leave it on; it never intercepts clicks and is left out of
+  `agent-desktop screenshot`. Refs belong to that session, so do not mix
+  commands with and without your own `--session`.
 - **Accessibility is on for the whole session.** Apps started on the Desktop
   (GTK, Qt, Chrome, Electron) expose their UI trees; an app started before the
   Desktop restarted may need a restart to appear in `list-apps`.

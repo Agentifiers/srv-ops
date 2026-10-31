@@ -149,6 +149,14 @@ with an orb section from `guest/agent-desktop-orb.md`.
   `/usr/local/bin/agent-desktop` loads `~/.cache/amp/desktop/environment` and
   the session's D-Bus address (read from labwc), so `agent-desktop ...` works
   from any shell while the Desktop is running.
+- **Visible agent cursor:** the fork draws agent-desktop's cursor overlay on
+  wlroots (layer-shell overlay: gliding dart, click ripple, action label,
+  macOS/Windows style), which the Desktop stream shows; labwc itself draws no
+  cursor into captured frames. The overlay belongs to an agent-desktop
+  session, so unless the caller chose one the wrapper keeps one session per
+  Desktop run (started with `--cursor`, keyed to labwc's PID in
+  `$XDG_RUNTIME_DIR/agent-desktop-cursor-session`) and passes it to every
+  command; a Desktop restart ends it and starts a new one.
 - **Accessibility on:** at-spi2-core 2.62 starts the accessibility bus
   disabled and ignores any default. labwc's system `autostart` (Amp writes only
   `~/.config/labwc/rc.xml`) enables it, links the bus socket to

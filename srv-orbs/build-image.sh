@@ -55,10 +55,10 @@ AWS_SDK_PACKAGES=(
 # Agentifiers fork's release; the archive matches upstream's layout. SKILL.md is
 # the agent-desktop skill at the same commit; guest/agent-desktop-orb.md is
 # appended to it.
-AGENT_DESKTOP_VERSION=1.0.2-wlroots.2
+AGENT_DESKTOP_VERSION=1.0.2-wlroots.3
 AGENT_DESKTOP_RELEASE="https://github.com/Agentifiers/agent-desktop/releases/download/v$AGENT_DESKTOP_VERSION"
 AGENT_DESKTOP_ARCHIVE="agent-desktop-v$AGENT_DESKTOP_VERSION-x86_64-unknown-linux-gnu.tar.gz"
-AGENT_DESKTOP_SHA256=c39264e21dd19795820de68f68140f119ca8f9bd23ca79eee3ab5b6ceaa8a488
+AGENT_DESKTOP_SHA256=0dc0624bf27e4de287e72bc41de35c1d63e5f6296940e29e04f45f3f0b5833c5
 AGENT_DESKTOP_SKILL_SHA256=359140fc5ede5ba29c54c24b4bb4eae374f65ecc883a83404cb7f96dc5edc3b9
 
 [[ $(id -u) == 0 ]] || { echo "run as root" >&2; exit 1; }
