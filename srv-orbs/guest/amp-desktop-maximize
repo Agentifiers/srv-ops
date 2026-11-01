@@ -1,0 +1,28 @@
+#!/bin/sh
+# /usr/local/lib/srv/amp-desktop-maximize: make labwc on Amp's orb Desktop open
+# normal app windows maximized, then reload its config.
+#
+# The Desktop is one streamed 1280x720 screen and Amp already maximizes its own
+# Chrome. labwc never tells clients where a window is, so agent-desktop can place
+# its cursor (and aim pointer input) only on maximized windows; with this rule
+# the agent's cursor shows for every action. Amp rewrites
+# ~/.config/labwc/rc.xml whenever it sets the Desktop up, so this runs from
+# labwc's autostart and again from the agent-desktop wrapper. Dialogs and other
+# non-normal windows keep their size. labwc reloads on SIGHUP; inside the
+# session LABWC_PID names it, the wrapper passes the PID as $1.
+rc="${XDG_CONFIG_HOME:-$HOME/.config}/labwc/rc.xml"
+rule='<windowRule identifier="*" type="normal"><action name="Maximize" /></windowRule>'
+
+[ -w "$rc" ] || exit 0
+grep -qF "$rule" "$rc" && exit 0
+tmp="$rc.amp-maximize.$$"
+if grep -q '</windowRules>' "$rc"; then
+	sed "s#</windowRules>#  $rule\n  </windowRules>#" "$rc" >"$tmp"
+elif grep -q '</labwc_config>' "$rc"; then
+	sed "s#</labwc_config>#  <windowRules>\n    $rule\n  </windowRules>\n</labwc_config>#" "$rc" >"$tmp"
+else
+	exit 0
+fi
+mv "$tmp" "$rc"
+pid="${1:-${LABWC_PID:-}}"
+[ -n "$pid" ] && kill -HUP "$pid" 2>/dev/null || true

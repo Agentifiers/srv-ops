@@ -176,6 +176,15 @@ with an orb section from `guest/agent-desktop-orb.md`.
   Desktop run (started with `--cursor`, keyed to labwc's PID in
   `$XDG_RUNTIME_DIR/agent-desktop-cursor-session`) and passes it to every
   command; a Desktop restart ends it and starts a new one.
+- **Windows open maximized:** labwc never tells a client where a window is,
+  and Amp's labwc 0.9.8 cannot capture single windows, so agent-desktop can
+  place its cursor (and aim pointer input) only on a focused, maximized window.
+  `/usr/local/lib/srv/amp-desktop-maximize` adds a labwc window rule that
+  maximizes every `normal` window (dialogs keep their size) to Amp's
+  `~/.config/labwc/rc.xml` and reloads labwc; labwc's autostart and the
+  wrapper both run it, because Amp rewrites that file when it sets the
+  Desktop up. The Desktop is one streamed screen and Amp already maximizes its
+  own Chrome.
 - **Accessibility on:** at-spi2-core 2.62 starts the accessibility bus
   disabled and ignores any default. labwc's system `autostart` (Amp writes only
   `~/.config/labwc/rc.xml`) enables it, links the bus socket to

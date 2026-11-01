@@ -29,12 +29,15 @@ yourself.
   `press`, `--headed type` and pointer input go through the wlroots virtual
   keyboard and pointer; semantic ref actions work headless. Window list,
   focus, close, minimize, maximize and restore work; move and resize refuse.
-- **Aiming at a ref with the pointer** (`--headed click`, hover, drag) needs
-  the window's place on screen, which this labwc proves only for a focused,
-  maximized window: run `focus-window` and `maximize --window-id <id>` first,
-  or use the headless semantic action or `mouse-click --xy`. A refusal with
-  `wlroots_window_origin_unproven` means exactly that. `screenshot` of the
-  whole display works; `screenshot --app`/`--window-id` refuses here.
+- **Windows open maximized.** labwc proves a window's place on screen only
+  for a focused, maximized window, and both your visible cursor and pointer
+  aiming at a ref (`--headed click`, hover, drag) need that place. The Desktop
+  therefore opens normal app windows maximized. If a window is not (it was
+  restored, or it is a dialog), run `focus-window` and `maximize --window-id
+  <id>` before acting on it; otherwise your actions still work but the user
+  sees no cursor, and pointer aiming refuses with
+  `wlroots_window_origin_unproven`. `screenshot` of the whole display works;
+  `screenshot --app`/`--window-id` refuses here.
 - **Xwayland windows take only the first synthetic click**; prefer native
   Wayland apps (Chrome on the Desktop is native) or semantic actions there.
 - **Installing apps.** This orb runs Arch Linux, not Debian. Chrome and the foot

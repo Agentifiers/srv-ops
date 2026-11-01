@@ -28,6 +28,8 @@ if [[ -z ${WAYLAND_DISPLAY:-}${DISPLAY:-} && -r $env_file ]]; then
 	if [[ -n $desktop_pid ]]; then
 		bus="$(tr '\0' '\n' <"/proc/$desktop_pid/environ" 2>/dev/null | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -n1)"
 		[[ -n $bus ]] && export DBUS_SESSION_BUS_ADDRESS="$bus"
+		# Amp may have rewritten labwc's config since the Desktop started.
+		/usr/local/lib/srv/amp-desktop-maximize "$desktop_pid" >/dev/null 2>&1 9>&- || true
 	else
 		echo "agent-desktop: the orb Desktop is not running; open the Desktop tab in the thread (or run: sudo systemctl start amp-desktop)" >&2
 	fi

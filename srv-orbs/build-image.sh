@@ -148,6 +148,7 @@ chmod 0755 "$mnt/opt/agent-desktop/agent-desktop" "$mnt/opt/agent-desktop/agent-
 install -m 0755 "$HERE/guest/agent-desktop" "$mnt/usr/local/bin/agent-desktop"
 install -D -m 0644 "$HERE/guest/labwc-environment" "$mnt/etc/xdg/labwc/environment"
 install -D -m 0644 "$HERE/guest/labwc-autostart" "$mnt/etc/xdg/labwc/autostart"
+install -D -m 0755 "$HERE/guest/amp-desktop-maximize" "$mnt/usr/local/lib/srv/amp-desktop-maximize"
 install -D -m 0644 "$HERE/guest/amp-desktop-accessibility.conf" \
 	"$mnt/etc/systemd/system/run-.service.d/amp-desktop-accessibility.conf"
 skill_dir=/home/user/.config/agents/skills/agent-desktop

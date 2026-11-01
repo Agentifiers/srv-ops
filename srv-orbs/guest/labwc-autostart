@@ -8,6 +8,9 @@
 # - Xwayland clients find the bus through the AT_SPI_BUS root-window property,
 #   which the launcher sets only when X is up as it starts, so publish it once
 #   Xwayland answers (xsettingsd keeps it running for the whole session).
+# - Open normal app windows maximized, so agent-desktop knows where they are and
+#   can show its cursor (see /usr/local/lib/srv/amp-desktop-maximize).
+/usr/local/lib/srv/amp-desktop-maximize >/dev/null 2>&1
 (
 	enabled=
 	for _ in $(seq 50); do
