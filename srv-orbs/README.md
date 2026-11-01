@@ -131,6 +131,25 @@ systemd-run` jobs, Docker containers (redroid), Amp services
 (`.amp/services.yaml`), `/tmp` and the orb's tailnet node and IP survive even
 that.
 
+## Project snapshots and image updates
+
+When an Amp project has a snapshot, Amp's spawn names it (`ORB_SNAPSHOT_ID`)
+and `srv-orb-dispatch` creates the orb from that snapshot's disk
+(`--template`), not from the image. Snapshots are captured from orbs that may
+themselves come from older snapshots, so without help a rebuilt image would
+never reach a project that has one.
+
+`srv-orb-keepalive` therefore records which image build every orb it creates
+and every snapshot it captures descends from (a hash of the image's
+`manifest.txt`, `SRV_ORB_IMAGE_MANIFEST` in the provider env), under
+`$SRV_ORB_STATE_DIR-keepalive/lineage/`. A spawn that would create an orb from
+a snapshot of an older or unknown build drops `ORB_SNAPSHOT_ID`: the dispatcher
+then takes Amp's base-image fallback for unknown snapshots, Amp runs the
+repository's `.agents/setup` on the fresh orb and captures a new snapshot from
+it. The first thread per project after an image rebuild therefore starts slower
+(full setup); later ones use the new snapshot. Existing orbs are unaffected;
+an unreadable manifest leaves snapshots alone.
+
 ## Desktop and computer use
 
 Every thread's orb has Amp's Desktop (the thread's **Desktop** tab): srv's orb

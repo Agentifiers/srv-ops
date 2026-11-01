@@ -13,14 +13,27 @@
 #   srv-orb-keepalive reap                              # stop orbs idle too long
 #   srv-orb-keepalive status                            # list kept-alive orbs
 #
-# Passed through unchanged: spawn, delete, and pauses that save a project
-# snapshot (ORB_SNAPSHOT_ID set; srv needs a stopped source for those).
+# Passed through unchanged: delete, and pauses that save a project snapshot
+# (ORB_SNAPSHOT_ID set; srv needs a stopped source for those).
+#
+# Project snapshots and image updates: a spawn that names a project snapshot
+# creates the orb from that snapshot's disk, not from the image, and each
+# snapshot is captured from an orb that may itself come from an older
+# snapshot, so image updates would never reach a project that has one. The
+# wrapper records which image build (a hash of the image's manifest.txt) every
+# orb it creates and every snapshot it captures descends from. A spawn that
+# creates an orb from a snapshot of an older or unknown build drops
+# ORB_SNAPSHOT_ID, so srv-orb-dispatch takes Amp's base-image fallback for
+# unknown snapshots and the thread starts from the current image (Amp then runs
+# the repository's setup and captures a fresh snapshot).
 #
 # Environment (the provider's env file):
 #   SRV_ORB_STATE_DIR         srv-orb-dispatch state dir (required)
 #   SRV_ORB_KEEPALIVE_HOURS   hours to keep a paused orb running (default 24;
 #                             0 = no keep-alive, every pause stops the VM)
 #   SRV_ORB_KEEPALIVE_DIR     marker dir (default "$SRV_ORB_STATE_DIR-keepalive")
+#   SRV_ORB_IMAGE_MANIFEST    the image's manifest.txt; unset or unreadable
+#                             leaves snapshots alone
 #   SRV_ORB_DISPATCH          real dispatcher (default /usr/local/bin/srv-orb-dispatch)
 set -euo pipefail
 
@@ -43,9 +56,33 @@ lock() {
 	flock 9
 }
 
+# build: the current image build's id, empty when the manifest is unreadable.
+build() {
+	[[ -r ${SRV_ORB_IMAGE_MANIFEST:-} ]] || return 0
+	sha256sum <"$SRV_ORB_IMAGE_MANIFEST" | cut -c1-16
+}
+
+# lineage KIND NAME [VALUE]: read, or atomically write, the image build an orb or
+# snapshot descends from.
+lineage() {
+	local file="$DIR/lineage/$1-$(key "$2")"
+	if (($# == 3)); then
+		mkdir -p "$DIR/lineage"
+		printf '%s\n' "$3" >"$file.tmp"
+		mv "$file.tmp" "$file"
+	elif [[ -r $file ]]; then
+		cat "$file"
+	fi
+}
+
+# known_orb ORB_ID: srv-orb-dispatch already has a record for this orb.
+known_orb() {
+	grep -qlF "\"orb_id\": \"$1\"" "${SRV_ORB_STATE_DIR%/}"/orb-*.json 2>/dev/null
+}
+
 dispatch() {
 	local id="${ORB_ID:?ORB_ID is not set}" op="${ORB_OPERATION:?ORB_OPERATION is not set}"
-	local marker
+	local marker current snap_build orb_build rc
 	marker="$DIR/$(key "$id").paused"
 	lock "$id"
 	if [[ $op == pause && -z ${ORB_SNAPSHOT_ID:-} && $HOURS -gt 0 ]]; then
@@ -55,6 +92,28 @@ dispatch() {
 		exit 0
 	fi
 	rm -f "$marker"
+	current="$(build)"
+	if [[ -n $current && $op == spawn ]] && ! known_orb "$id"; then
+		# This spawn creates the orb.
+		orb_build=$current
+		if [[ -n ${ORB_SNAPSHOT_ID:-} ]]; then
+			snap_build="$(lineage snapshot "$ORB_SNAPSHOT_ID")"
+			if [[ $snap_build == "$current" ]]; then
+				orb_build=$snap_build
+			else
+				log "spawn $id: snapshot $ORB_SNAPSHOT_ID predates image build $current (its build: ${snap_build:-unknown}); creating from the image"
+				unset ORB_SNAPSHOT_ID
+			fi
+		fi
+		lineage orb "$id" "$orb_build"
+	fi
+	if [[ -n $current && $op == pause && -n ${ORB_SNAPSHOT_ID:-} ]]; then
+		rc=0
+		"$REAL" "$@" || rc=$?
+		orb_build="$(lineage orb "$id")"
+		((rc == 0)) && [[ -n $orb_build ]] && lineage snapshot "$ORB_SNAPSHOT_ID" "$orb_build"
+		exit "$rc"
+	fi
 	exec "$REAL" "$@"
 }
 
