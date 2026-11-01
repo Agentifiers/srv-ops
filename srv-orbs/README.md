@@ -185,6 +185,15 @@ with an orb section from `guest/agent-desktop-orb.md`.
   wrapper both run it, because Amp rewrites that file when it sets the
   Desktop up. The Desktop is one streamed screen and Amp already maximizes its
   own Chrome.
+- **Reconnecting to a static Desktop:** Amp's stream (waymote) encodes only
+  when the screen is damaged and has no way to force a frame for a viewer that
+  is still waiting for its first one, so after a stream restart a reconnecting
+  Desktop tab stayed blank until something on screen changed.
+  `amp-desktop-repaint` (`guest/amp-desktop-repaint.c`, compiled in the image)
+  keeps a fully transparent 1x1 overlay surface with an empty input region;
+  labwc's autostart starts it and follows `~/.cache/amp/desktop/waymote.log`,
+  signalling it 1, 3 and 6 seconds after each `video client N connected`. Each
+  signal recommits the invisible pixel, which gives the stream a frame.
 - **Accessibility on:** at-spi2-core 2.62 starts the accessibility bus
   disabled and ignores any default. labwc's system `autostart` (Amp writes only
   `~/.config/labwc/rc.xml`) enables it, links the bus socket to

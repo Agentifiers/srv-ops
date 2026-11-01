@@ -11,6 +11,20 @@
 # - Open normal app windows maximized, so agent-desktop knows where they are and
 #   can show its cursor (see /usr/local/lib/srv/amp-desktop-maximize).
 /usr/local/lib/srv/amp-desktop-maximize >/dev/null 2>&1
+# - Amp's Desktop stream encodes only on screen damage, so a viewer that
+#   reconnects to a static screen (after the stream restarted) gets no first
+#   frame. A transparent 1x1 overlay surface is recommitted 1, 3 and 6 seconds
+#   after each viewer connects (see /usr/local/lib/srv/amp-desktop-repaint).
+/usr/local/lib/srv/amp-desktop-repaint >/dev/null 2>&1 &
+repaint=$!
+(
+	tail -n 0 -F "$HOME/.cache/amp/desktop/waymote.log" 2>/dev/null | while IFS= read -r line; do
+		case $line in
+		*"video client "*" connected"*)
+			(for delay in 1 2 3; do sleep "$delay"; kill -USR1 "$repaint" 2>/dev/null; done) & ;;
+		esac
+	done
+) >/dev/null 2>&1 &
 (
 	enabled=
 	for _ in $(seq 50); do

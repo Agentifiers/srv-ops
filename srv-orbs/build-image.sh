@@ -38,6 +38,8 @@ PACKAGES=(
 	xorg-server-xvfb
 	# agent-desktop's clipboard commands on the Wayland Desktop.
 	wl-clipboard
+	# Protocol XML for building amp-desktop-repaint (guest/amp-desktop-repaint.c).
+	wayland-protocols wlr-protocols
 )
 
 # AWS SDK for JavaScript v3, installed globally. CommonJS require() finds it
@@ -149,6 +151,20 @@ install -m 0755 "$HERE/guest/agent-desktop" "$mnt/usr/local/bin/agent-desktop"
 install -D -m 0644 "$HERE/guest/labwc-environment" "$mnt/etc/xdg/labwc/environment"
 install -D -m 0644 "$HERE/guest/labwc-autostart" "$mnt/etc/xdg/labwc/autostart"
 install -D -m 0755 "$HERE/guest/amp-desktop-maximize" "$mnt/usr/local/lib/srv/amp-desktop-maximize"
+# Built in the image so it links against the image's libwayland and glibc;
+# staged under /var/tmp because arch-chroot mounts an empty tmpfs on /tmp.
+build="$(mktemp -d "$mnt/var/tmp/amp-desktop-repaint.XXXXXX")"
+install -m 0644 "$HERE/guest/amp-desktop-repaint.c" "$build/"
+arch-chroot "$mnt" bash -euo pipefail -c "
+	cd /var/tmp/$(basename "$build")
+	layer=/usr/share/wlr-protocols/unstable/wlr-layer-shell-unstable-v1.xml
+	wayland-scanner client-header \$layer layer-shell.h
+	wayland-scanner private-code \$layer layer-shell.c
+	wayland-scanner private-code /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml xdg-shell.c
+	cc -O2 -Wall -Wextra -Werror -I. -o amp-desktop-repaint amp-desktop-repaint.c layer-shell.c xdg-shell.c -lwayland-client
+	install -D -m 0755 amp-desktop-repaint /usr/local/lib/srv/amp-desktop-repaint
+"
+rm -rf "$build"
 install -D -m 0644 "$HERE/guest/amp-desktop-accessibility.conf" \
 	"$mnt/etc/systemd/system/run-.service.d/amp-desktop-accessibility.conf"
 skill_dir=/home/user/.config/agents/skills/agent-desktop
