@@ -68,9 +68,36 @@ garm-cli org add --name <org> --credentials <org>-app --install-webhook --random
 Expose only the webhook path publicly:
 `tailscale funnel --bg --https $GARM_WEBHOOK_FUNNEL_PORT --set-path /webhooks http://$SITE_HOST_TAILNET_IP:$GARM_API_PORT/webhooks`.
 
+### Repositories owned by a user account
+
+GARM can only register organizations as orgs, so a repo owned by a personal
+account is registered as a repo, with its own App owned by that account:
+
+1. Account settings → Developer settings → GitHub Apps → New, with
+   **Webhook → Active** unchecked and Repository **Administration: R/W**
+   (repo-level self-hosted runners), **Webhooks: R/W** and **Metadata: R**.
+   Install it on the account with **Only select repositories** set to the
+   repo, and note the App ID and Installation ID as above.
+2. Register it:
+
+```sh
+garm-cli github credentials add --name <user>-app --auth-type app \
+  --app-id <app-id> --app-installation-id <installation-id> \
+  --private-key-path ~/.config/srv-gha/keys/<user>.pem --endpoint github.com \
+  --description "<user> GitHub App"
+garm-cli repo add --owner <user> --name <repo> --credentials <user>-app \
+  --install-webhook --random-webhook-secret
+garm-cli pool add --repo <repo-id> --provider-name srv --image "$GHA_RUNNER_IMAGE" \
+  --flavor 6c-12g-30g --os-type linux --os-arch amd64 --runner-prefix gha \
+  --tags self-hosted,linux,x64,bazel,srv --max-runners 2 --min-idle-runners 0 --enabled
+```
+
+More repos under the same account need only another `repo add` and pool, after
+adding them to the App installation.
+
 ## Pools
 
-Each org gets one pool, for example:
+Each org or repo gets one pool, for example:
 
 - Flavor `6c-12g-30g`, image `$GHA_RUNNER_IMAGE`.
 - Max 4 runners, 1 warm idle runner.
