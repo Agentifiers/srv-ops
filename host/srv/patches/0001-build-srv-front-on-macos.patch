@@ -1,0 +1,962 @@
+From e70603dba05ca77b8c817fc692ce2f67459086e1 Mon Sep 17 00:00:00 2001
+From: Ben Kraus <406385+benkraus@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 14:32:34 -0700
+Subject: [PATCH] Build srv-front on macOS
+
+srv-front only exchanges JSON with backends, but it imported vmrunner for
+the cold-disk migration message types, which pulled in the Firecracker
+SDK and CNI, and its remaining dependencies used Linux-only syscalls.
+
+- Move MigrationDisk, MigrationDiskRequest and MigrationDiskResult into
+  internal/migrationdisk (Transfer, Request, Result) so srv-front no
+  longer depends on vmrunner.
+- host: read the kernel release with x/sys/unix.Uname, available on
+  Linux and macOS.
+- storage: compute available bytes independent of the statfs field
+  width; keep the O_PATH opener in open_linux.go with an unsupported
+  stub elsewhere.
+- coldstore: route RENAME_NOREPLACE renames through renameNoReplace,
+  Linux-only with an unsupported stub elsewhere.
+- CI cross-builds srv-front for darwin/arm64 and darwin/amd64.
+- Document running srv-front on macOS under launchd, with an example
+  LaunchDaemon in contrib/launchd.
+
+Linux behaviour is unchanged.
+---
+ .github/workflows/test.yml                    |  5 ++
+ contrib/launchd/srv-front.plist               | 36 ++++++++++++
+ docs/getting-started/multi-host.md            | 57 ++++++++++++++++++-
+ internal/coldstore/client.go                  |  3 +-
+ internal/coldstore/discard.go                 |  4 +-
+ internal/coldstore/rename_linux.go            |  8 +++
+ internal/coldstore/rename_other.go            | 11 ++++
+ internal/coldstore/server.go                  |  5 +-
+ internal/front/front.go                       | 10 ++--
+ internal/front/front_test.go                  |  8 +--
+ internal/host/host.go                         | 19 ++-----
+ internal/migrationdisk/migrationdisk.go       | 31 ++++++++++
+ internal/provision/backup.go                  | 12 ++--
+ internal/provision/migration.go               | 20 +++----
+ internal/provision/provision_test.go          |  3 +-
+ internal/service/forward_test.go              |  5 +-
+ internal/service/migration.go                 |  4 +-
+ internal/storage/disk_space.go                |  2 +-
+ internal/storage/open_linux.go                | 56 ++++++++++++++++++
+ internal/storage/open_other.go                | 14 +++++
+ internal/storage/subvolume.go                 | 46 ---------------
+ internal/vmrunner/cold_disk_test.go           |  8 ++-
+ internal/vmrunner/migration_disk.go           | 39 +++----------
+ internal/vmrunner/payload_integration_test.go |  6 +-
+ 24 files changed, 277 insertions(+), 135 deletions(-)
+ create mode 100644 contrib/launchd/srv-front.plist
+ create mode 100644 internal/coldstore/rename_linux.go
+ create mode 100644 internal/coldstore/rename_other.go
+ create mode 100644 internal/migrationdisk/migrationdisk.go
+ create mode 100644 internal/storage/open_linux.go
+ create mode 100644 internal/storage/open_other.go
+
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 299b217..7a8a9ab 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -31,6 +31,11 @@ jobs:
+       - name: Build
+         run: go build ./...
+ 
++      - name: Build srv-front for macOS
++        run: |
++          GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/srv-front
++          GOOS=darwin GOARCH=amd64 go build -o /dev/null ./cmd/srv-front
++
+       - name: Test
+         run: go test ./... -count=1 -coverprofile=coverage.out
+ 
+diff --git a/contrib/launchd/srv-front.plist b/contrib/launchd/srv-front.plist
+new file mode 100644
+index 0000000..87018d9
+--- /dev/null
++++ b/contrib/launchd/srv-front.plist
+@@ -0,0 +1,36 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<!-- srv multi-host SSH frontend on macOS; see docs/getting-started/multi-host.md. -->
++<plist version="1.0">
++<dict>
++	<key>Label</key>
++	<string>srv-front</string>
++	<key>ProgramArguments</key>
++	<array>
++		<string>/usr/local/bin/srv-front</string>
++		<string>--config</string>
++		<string>/usr/local/etc/srv-front.json</string>
++	</array>
++	<key>UserName</key>
++	<string>_srvfront</string>
++	<key>GroupName</key>
++	<string>_srvfront</string>
++	<key>Umask</key>
++	<integer>63</integer>
++	<key>RunAtLoad</key>
++	<true/>
++	<key>KeepAlive</key>
++	<dict>
++		<key>SuccessfulExit</key>
++		<false/>
++	</dict>
++	<key>ThrottleInterval</key>
++	<integer>5</integer>
++	<key>ExitTimeOut</key>
++	<integer>30</integer>
++	<key>StandardOutPath</key>
++	<string>/usr/local/var/log/srv-front.log</string>
++	<key>StandardErrorPath</key>
++	<string>/usr/local/var/log/srv-front.log</string>
++</dict>
++</plist>
+diff --git a/docs/getting-started/multi-host.md b/docs/getting-started/multi-host.md
+index 055e716..295fda7 100644
+--- a/docs/getting-started/multi-host.md
++++ b/docs/getting-started/multi-host.md
+@@ -2,8 +2,9 @@
+ 
+ `srv-front` provides one SSH endpoint in front of independent `srv` hosts. It
+ keeps only a static host configuration and its own Tailscale/SSH identity, not a
+-VM registry. It can run on a small separate Linux server without KVM,
+-Firecracker, a reflink filesystem, or the srv helper services.
++VM registry. It can run on a small separate Linux server or a Mac (see
++[Run on macOS](#run-on-macos)) without KVM, Firecracker, a reflink filesystem,
++or the srv helper services.
+ 
+ Each backend still owns VM state, permissions, admission, images, pools, and
+ backups. An unavailable frontend does not stop VMs; direct backend SSH remains
+@@ -83,6 +84,58 @@ configured stable node IDs, then apply their usual `SRV_ALLOWED_USERS`,
+ user identity, actual frontend peer address, and forwarding node ID. No SSH
+ username grants delegation rights. A trusted frontend itself may be tagged.
+ 
++## Run on macOS
++
++`srv-front` builds for macOS; the frontend needs none of srv's Linux-only VM,
++storage, or network code. Cross-compile on any host (`arm64` for Apple silicon,
++`amd64` for Intel Macs), or build natively on the Mac:
++
++```bash
++GOOS=darwin GOARCH=arm64 go build -o srv-front ./cmd/srv-front
++```
++
++On the Mac, run it as a dedicated role account under launchd. Pick a free
++UID/GID below 500 (`dscl . -list /Users UniqueID`):
++
++```bash
++sudo dscl . -create /Groups/_srvfront PrimaryGroupID 450
++sudo dscl . -create /Users/_srvfront UniqueID 450
++sudo dscl . -create /Users/_srvfront PrimaryGroupID 450
++sudo dscl . -create /Users/_srvfront UserShell /usr/bin/false
++sudo dscl . -create /Users/_srvfront NFSHomeDirectory /var/empty
++sudo dscl . -create /Users/_srvfront IsHidden 1
++
++sudo install -m 0755 srv-front /usr/local/bin/srv-front
++sudo install -d -o _srvfront -g _srvfront -m 0700 /usr/local/var/srv-front
++sudo install -d -m 0755 /usr/local/var/log
++sudo install -o _srvfront -g _srvfront -m 0600 /dev/null /usr/local/var/log/srv-front.log
++```
++
++Create `/usr/local/etc/srv-front.json` as above with
++`"data_dir": "/usr/local/var/srv-front"`. The listener lives on the frontend's
++own tailnet address, so `:22` does not conflict with macOS Remote Login.
++
++launchd has no environment file. Join the tailnet once in the foreground with
++the credentials from above, and stop it after it logs its stable node ID; the
++node state in `data_dir` keeps the identity, so the daemon needs no credentials:
++
++```bash
++sudo -u _srvfront env TS_AUTHKEY=tskey-auth-... \
++  /usr/local/bin/srv-front --config /usr/local/etc/srv-front.json
++```
++
++Then install and start the daemon:
++
++```bash
++sudo install -m 0644 contrib/launchd/srv-front.plist /Library/LaunchDaemons/srv-front.plist
++sudo launchctl bootstrap system /Library/LaunchDaemons/srv-front.plist
++tail -f /usr/local/var/log/srv-front.log
++```
++
++Trust its node ID on each backend as described above. `sudo launchctl
++kickstart -k system/srv-front` restarts it after a configuration change;
++`sudo launchctl bootout system/srv-front` stops and unloads it.
++
+ ## Commands and placement
+ 
+ ```bash
+diff --git a/internal/coldstore/client.go b/internal/coldstore/client.go
+index 01fd007..70d9f75 100644
+--- a/internal/coldstore/client.go
++++ b/internal/coldstore/client.go
+@@ -13,7 +13,6 @@ import (
+ 	"syscall"
+ 	"time"
+ 
+-	"golang.org/x/sys/unix"
+ 	"srv/internal/storage"
+ )
+ 
+@@ -349,7 +348,7 @@ func (c Client) Get(ctx context.Context, o Object, destDir, parentID string) (st
+ 	dest := filepath.Join(destDir, o.ID)
+ 	// Publish the ordinary container: RENAME_NOREPLACE on a read-only Btrfs
+ 	// subvolume can return EROFS. Keep the received disk immutable throughout.
+-	if err := unix.Renameat2(unix.AT_FDCWD, stage, unix.AT_FDCWD, dest, unix.RENAME_NOREPLACE); err != nil {
++	if err := renameNoReplace(stage, dest); err != nil {
+ 		return "", err
+ 	}
+ 	if err := storage.SyncPath(destDir); err != nil {
+diff --git a/internal/coldstore/discard.go b/internal/coldstore/discard.go
+index 37b1882..e66a21b 100644
+--- a/internal/coldstore/discard.go
++++ b/internal/coldstore/discard.go
+@@ -7,8 +7,6 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"syscall"
+-
+-	"golang.org/x/sys/unix"
+ )
+ 
+ // DiscardObjects is a LOCAL administrator-only, irreversible recovery operation,
+@@ -90,7 +88,7 @@ func DiscardObjects(ctx context.Context, root string, ids []string) error {
+ 		}
+ 		for _, id := range present {
+ 			stage := filepath.Join(root, ".stage-delete-"+id)
+-			if err := unix.Renameat2(unix.AT_FDCWD, s.path(id), unix.AT_FDCWD, stage, unix.RENAME_NOREPLACE); err != nil {
++			if err := renameNoReplace(s.path(id), stage); err != nil {
+ 				return err
+ 			}
+ 		}
+diff --git a/internal/coldstore/rename_linux.go b/internal/coldstore/rename_linux.go
+new file mode 100644
+index 0000000..0add20f
+--- /dev/null
++++ b/internal/coldstore/rename_linux.go
+@@ -0,0 +1,8 @@
++package coldstore
++
++import "golang.org/x/sys/unix"
++
++// renameNoReplace renames atomically and fails if newpath already exists.
++func renameNoReplace(oldpath, newpath string) error {
++	return unix.Renameat2(unix.AT_FDCWD, oldpath, unix.AT_FDCWD, newpath, unix.RENAME_NOREPLACE)
++}
+diff --git a/internal/coldstore/rename_other.go b/internal/coldstore/rename_other.go
+new file mode 100644
+index 0000000..5009b2c
+--- /dev/null
++++ b/internal/coldstore/rename_other.go
+@@ -0,0 +1,11 @@
++//go:build !linux
++
++package coldstore
++
++import "errors"
++
++// renameNoReplace relies on Linux renameat2. Other platforms build this
++// package only for shared types (srv-front), never to move cold-store objects.
++func renameNoReplace(oldpath, newpath string) error {
++	return errors.ErrUnsupported
++}
+diff --git a/internal/coldstore/server.go b/internal/coldstore/server.go
+index f475e0d..e156423 100644
+--- a/internal/coldstore/server.go
++++ b/internal/coldstore/server.go
+@@ -14,6 +14,7 @@ import (
+ 
+ 	"github.com/google/uuid"
+ 	"golang.org/x/sys/unix"
++
+ 	"srv/internal/storage"
+ )
+ 
+@@ -378,7 +379,7 @@ func (s server) put(ctx context.Context, o Object, in io.Reader, compression str
+ 	if err := storage.SyncPath(stage); err != nil {
+ 		return err
+ 	}
+-	if err := unix.Renameat2(unix.AT_FDCWD, stage, unix.AT_FDCWD, s.path(o.ID), unix.RENAME_NOREPLACE); err != nil {
++	if err := renameNoReplace(stage, s.path(o.ID)); err != nil {
+ 		return err
+ 	}
+ 	// Publication is the point of no return. Any following sync/SSH failure is
+@@ -453,7 +454,7 @@ func (s server) delete(ctx context.Context, id string) error {
+ 	if _, err := s.deletionRecord(id, true); err != nil {
+ 		return err
+ 	}
+-	if err := unix.Renameat2(unix.AT_FDCWD, s.path(id), unix.AT_FDCWD, stage, unix.RENAME_NOREPLACE); err != nil {
++	if err := renameNoReplace(s.path(id), stage); err != nil {
+ 		return err
+ 	}
+ 	// No removal before the rename is durable. Failures leave a recoverable
+diff --git a/internal/front/front.go b/internal/front/front.go
+index 6b8bec8..f00cd91 100644
+--- a/internal/front/front.go
++++ b/internal/front/front.go
+@@ -20,8 +20,8 @@ import (
+ 	"srv/internal/format"
+ 	"srv/internal/host"
+ 	"srv/internal/identity"
++	"srv/internal/migrationdisk"
+ 	"srv/internal/model"
+-	"srv/internal/vmrunner"
+ )
+ 
+ // errNoEligibleHost means placement refused a create before any host received it.
+@@ -466,7 +466,7 @@ func (r *Router) migrate(ctx context.Context, a model.Actor, args []string, over
+ 		return fmt.Errorf("target ineligible: %s", p.Reason)
+ 	}
+ 	token := uuid.NewString()
+-	q := vmrunner.MigrationDiskRequest{Action: "check", Name: name, InstanceID: v.ID, Token: token}
++	q := migrationdisk.Request{Action: "check", Name: name, InstanceID: v.ID, Token: token}
+ 	for _, h := range []Host{source, target} {
+ 		if _, err := r.commandJSON(ctx, h, a, migrationDiskArgs(q)); err != nil {
+ 			return fmt.Errorf("host %s native migration unavailable (source not prepared): %w", h.Name, err)
+@@ -500,7 +500,7 @@ func (r *Router) migrate(ctx context.Context, a model.Actor, args []string, over
+ 	if err != nil {
+ 		return err
+ 	}
+-	var transfer vmrunner.MigrationDiskResult
++	var transfer migrationdisk.Result
+ 	if err = json.Unmarshal(data, &transfer); err != nil {
+ 		return err
+ 	}
+@@ -513,7 +513,7 @@ func (r *Router) migrate(ctx context.Context, a model.Actor, args []string, over
+ 	if err != nil {
+ 		return err
+ 	}
+-	var base vmrunner.MigrationDiskResult
++	var base migrationdisk.Result
+ 	if err = json.Unmarshal(data, &base); err != nil {
+ 		return err
+ 	}
+@@ -571,7 +571,7 @@ func (r *Router) migrate(ctx context.Context, a model.Actor, args []string, over
+ 	return nil
+ }
+ 
+-func migrationDiskArgs(q vmrunner.MigrationDiskRequest) []string {
++func migrationDiskArgs(q migrationdisk.Request) []string {
+ 	data, _ := json.Marshal(q) // This concrete struct contains no unsupported JSON types.
+ 	return []string{"migration-disk", base64.RawURLEncoding.EncodeToString(data)}
+ }
+diff --git a/internal/front/front_test.go b/internal/front/front_test.go
+index 0c48634..24835d7 100644
+--- a/internal/front/front_test.go
++++ b/internal/front/front_test.go
+@@ -15,8 +15,8 @@ import (
+ 
+ 	"srv/internal/coldstore"
+ 	"srv/internal/front"
++	"srv/internal/migrationdisk"
+ 	"srv/internal/model"
+-	"srv/internal/vmrunner"
+ )
+ 
+ type fake func(front.Host, []string, io.Reader, io.Writer) error
+@@ -186,7 +186,7 @@ func (b *migrationBackend) run(h front.Host, args []string, in io.Reader, out io
+ 	if cmd == "--json" {
+ 		cmd = args[1]
+ 	}
+-	var q vmrunner.MigrationDiskRequest
++	var q migrationdisk.Request
+ 	action := cmd
+ 	if cmd == "migration-disk" {
+ 		if len(args) < 2 {
+@@ -289,14 +289,14 @@ func (b *migrationBackend) run(h front.Host, args []string, in io.Reader, out io
+ 			_, err := io.WriteString(out, `{}`)
+ 			return err
+ 		case "prepare":
+-			return json.NewEncoder(out).Encode(vmrunner.MigrationDiskResult{Transfer: vmrunner.MigrationDisk{
++			return json.NewEncoder(out).Encode(migrationdisk.Result{Transfer: migrationdisk.Transfer{
+ 				Disk: coldstore.Object{ID: q.Token, Parent: "shared-base"}, Base: &coldstore.Object{ID: "shared-base"},
+ 			}})
+ 		case "base-present":
+ 			if q.Transfer.Base == nil || q.Transfer.Disk.ID != q.Token || q.Transfer.Disk.Parent != q.Transfer.Base.ID {
+ 				return errors.New("source transfer objects not forwarded to destination")
+ 			}
+-			return json.NewEncoder(out).Encode(vmrunner.MigrationDiskResult{BasePresent: b.bases[q.Transfer.Base.ID]})
++			return json.NewEncoder(out).Encode(migrationdisk.Result{BasePresent: b.bases[q.Transfer.Base.ID]})
+ 		case "send-base", "send-disk", "metadata":
+ 			_, err := io.WriteString(out, q.Token)
+ 			return err
+diff --git a/internal/host/host.go b/internal/host/host.go
+index 030c62c..1c009ab 100644
+--- a/internal/host/host.go
++++ b/internal/host/host.go
+@@ -8,6 +8,8 @@ import (
+ 	"strings"
+ 	"syscall"
+ 
++	"golang.org/x/sys/unix"
++
+ 	"srv/internal/format"
+ )
+ 
+@@ -138,9 +140,9 @@ func ReadOSInfo() OSInfo {
+ 		info.Name = parseOSRelease(string(data))
+ 	}
+ 
+-	var uname syscall.Utsname
+-	if err := syscall.Uname(&uname); err == nil {
+-		info.Kernel = int8ToString(uname.Release[:])
++	var uname unix.Utsname
++	if err := unix.Uname(&uname); err == nil {
++		info.Kernel = unix.ByteSliceToString(uname.Release[:])
+ 	}
+ 
+ 	return info
+@@ -165,17 +167,6 @@ func parseOSRelease(data string) string {
+ 	return name
+ }
+ 
+-func int8ToString(arr []int8) string {
+-	b := make([]byte, 0, len(arr))
+-	for _, v := range arr {
+-		if v == 0 {
+-			break
+-		}
+-		b = append(b, byte(v))
+-	}
+-	return string(b)
+-}
+-
+ func ReadCPUInfo() CPUInfo {
+ 	info := CPUInfo{
+ 		LogicalCores: runtime.NumCPU(),
+diff --git a/internal/migrationdisk/migrationdisk.go b/internal/migrationdisk/migrationdisk.go
+new file mode 100644
+index 0000000..5a8ef06
+--- /dev/null
++++ b/internal/migrationdisk/migrationdisk.go
+@@ -0,0 +1,31 @@
++// Package migrationdisk holds the cold-disk migration messages exchanged by
++// srv-front, the srv service and the VM runner. It stays free of runtime
++// dependencies so srv-front builds on platforms without the VM stack.
++package migrationdisk
++
++import (
++	"srv/internal/coldstore"
++	"srv/internal/storage"
++)
++
++// Transfer describes immutable transfer objects, not a space reservation.
++// Base is retained at the destination; Disk is discarded after publication.
++type Transfer struct {
++	Disk coldstore.Object  `json:"disk"`
++	Base *coldstore.Object `json:"base,omitempty"`
++}
++
++type Request struct {
++	Action       string                    `json:"action"`
++	Name         string                    `json:"name"`
++	InstanceID   string                    `json:"instance_id"`
++	Token        string                    `json:"token"`
++	ExpectedDisk storage.SubvolumeIdentity `json:"expected_disk"`
++	Transfer     Transfer                  `json:"transfer"`
++}
++
++type Result struct {
++	Transfer          Transfer `json:"transfer"`
++	BasePresent       bool     `json:"base_present"`
++	SerializedPayload bool     `json:"serialized_payload"`
++}
+diff --git a/internal/provision/backup.go b/internal/provision/backup.go
+index 2672dbf..feeb1cd 100644
+--- a/internal/provision/backup.go
++++ b/internal/provision/backup.go
+@@ -18,9 +18,9 @@ import (
+ 	"github.com/klauspost/compress/zstd"
+ 
+ 	"srv/internal/format"
++	"srv/internal/migrationdisk"
+ 	"srv/internal/model"
+ 	"srv/internal/storage"
+-	"srv/internal/vmrunner"
+ )
+ 
+ const (
+@@ -85,7 +85,7 @@ type portableManifest struct {
+ 	ExportedAt     time.Time               `json:"exported_at"`
+ 	Instance       portableInstance        `json:"instance"`
+ 	Files          backupFiles             `json:"files"`
+-	NativeDisk     *vmrunner.MigrationDisk `json:"native_disk,omitempty"`
++	NativeDisk     *migrationdisk.Transfer `json:"native_disk,omitempty"`
+ }
+ 
+ type portableInstance struct {
+@@ -519,11 +519,11 @@ func (p *Provisioner) ExportInstance(ctx context.Context, name string, w io.Writ
+ 
+ // ExportNativeMetadata retains the existing manifest/log framing. The disk
+ // itself has already travelled through the privileged Send/Receive path.
+-func (p *Provisioner) ExportNativeMetadata(ctx context.Context, name string, w io.Writer, transfer vmrunner.MigrationDisk) (PortableArtifactInfo, error) {
++func (p *Provisioner) ExportNativeMetadata(ctx context.Context, name string, w io.Writer, transfer migrationdisk.Transfer) (PortableArtifactInfo, error) {
+ 	return p.exportInstance(ctx, name, w, &transfer)
+ }
+ 
+-func (p *Provisioner) exportInstance(ctx context.Context, name string, w io.Writer, native *vmrunner.MigrationDisk) (PortableArtifactInfo, error) {
++func (p *Provisioner) exportInstance(ctx context.Context, name string, w io.Writer, native *migrationdisk.Transfer) (PortableArtifactInfo, error) {
+ 	inst, err := p.requireStoppedInstance(ctx, name)
+ 	if err != nil {
+ 		return PortableArtifactInfo{}, err
+@@ -920,7 +920,7 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
+ 	}
+ 
+ 	if manifest.NativeDisk != nil {
+-		if _, err := p.migrationDiskRPC(ctx, vmrunner.MigrationDiskRequest{Action: "publish", Name: imported.Name, InstanceID: imported.ID, Token: manifest.MigrationToken, Transfer: *manifest.NativeDisk}, nil, nil); err != nil {
++		if _, err := p.migrationDiskRPC(ctx, migrationdisk.Request{Action: "publish", Name: imported.Name, InstanceID: imported.ID, Token: manifest.MigrationToken, Transfer: *manifest.NativeDisk}, nil, nil); err != nil {
+ 			return model.Instance{}, PortableArtifactInfo{}, err
+ 		}
+ 	}
+@@ -964,7 +964,7 @@ func (p *Provisioner) ImportInstanceWithOptions(ctx context.Context, actor model
+ 	if manifest.NativeDisk != nil {
+ 		// Publication and the SQLite receipt are durable. Cleanup failure must
+ 		// not turn the committed import into an uncommitted result.
+-		if _, err := p.migrationDiskRPC(ctx, vmrunner.MigrationDiskRequest{Action: "discard", Name: imported.Name, InstanceID: imported.ID, Token: manifest.MigrationToken, Transfer: *manifest.NativeDisk}, nil, nil); err != nil {
++		if _, err := p.migrationDiskRPC(ctx, migrationdisk.Request{Action: "discard", Name: imported.Name, InstanceID: imported.ID, Token: manifest.MigrationToken, Transfer: *manifest.NativeDisk}, nil, nil); err != nil {
+ 			p.log.Warn("committed migration retains transfer object; administrator cleanup required", "name", imported.Name, "token", manifest.MigrationToken, "err", err)
+ 		}
+ 	}
+diff --git a/internal/provision/migration.go b/internal/provision/migration.go
+index 3c8dd2a..2fbc3cb 100644
+--- a/internal/provision/migration.go
++++ b/internal/provision/migration.go
+@@ -8,17 +8,17 @@ import (
+ 	"io"
+ 	"path/filepath"
+ 
++	"srv/internal/migrationdisk"
+ 	"srv/internal/model"
+ 	"srv/internal/storage"
+-	"srv/internal/vmrunner"
+ )
+ 
+-func (p *Provisioner) migrationDiskRPC(ctx context.Context, q vmrunner.MigrationDiskRequest, in io.Reader, out io.Writer) (vmrunner.MigrationDiskResult, error) {
++func (p *Provisioner) migrationDiskRPC(ctx context.Context, q migrationdisk.Request, in io.Reader, out io.Writer) (migrationdisk.Result, error) {
+ 	runner, ok := p.vmRunner.(interface {
+-		MigrationDisk(context.Context, vmrunner.MigrationDiskRequest, io.Reader, io.Writer) (vmrunner.MigrationDiskResult, error)
++		MigrationDisk(context.Context, migrationdisk.Request, io.Reader, io.Writer) (migrationdisk.Result, error)
+ 	})
+ 	if !ok {
+-		return vmrunner.MigrationDiskResult{}, errors.New("runner does not support native migration")
++		return migrationdisk.Result{}, errors.New("runner does not support native migration")
+ 	}
+ 	return runner.MigrationDisk(ctx, q, in, out)
+ }
+@@ -26,30 +26,30 @@ func (p *Provisioner) migrationDiskRPC(ctx context.Context, q vmrunner.Migration
+ // TransferMigrationDisk is called under the service's instance lock, only for
+ // native commands from an authenticated trusted frontend. Source operations
+ // additionally require the durable prepared migration fence and its token.
+-func (p *Provisioner) TransferMigrationDisk(ctx context.Context, q vmrunner.MigrationDiskRequest, in io.Reader, out io.Writer) (vmrunner.MigrationDiskResult, error) {
++func (p *Provisioner) TransferMigrationDisk(ctx context.Context, q migrationdisk.Request, in io.Reader, out io.Writer) (migrationdisk.Result, error) {
+ 	switch q.Action {
+ 	case "prepare", "send-base", "send-disk", "cleanup":
+ 		inst, err := p.requireStoppedInstance(ctx, q.Name)
+ 		if err != nil {
+-			return vmrunner.MigrationDiskResult{}, err
++			return migrationdisk.Result{}, err
+ 		}
+ 		m, err := p.store.GetMigration(ctx, inst.ID)
+ 		if err != nil {
+-			return vmrunner.MigrationDiskResult{}, err
++			return migrationdisk.Result{}, err
+ 		}
+ 		if m.Token != q.Token || (m.Phase != "prepared" && !(q.Action == "cleanup" && m.Phase == "completed")) {
+-			return vmrunner.MigrationDiskResult{}, errors.New("native transfer requires the matching prepared migration")
++			return migrationdisk.Result{}, errors.New("native transfer requires the matching prepared migration")
+ 		}
+ 		q.InstanceID = inst.ID
+ 		if q.Action == "prepare" {
+ 			q.ExpectedDisk, err = storage.ValidateDiskSubvolume(ctx, filepath.Dir(inst.RootFSPath))
+ 			if err != nil {
+-				return vmrunner.MigrationDiskResult{}, err
++				return migrationdisk.Result{}, err
+ 			}
+ 		}
+ 	case "check", "base-present", "receive-base", "receive-disk":
+ 	default:
+-		return vmrunner.MigrationDiskResult{}, errors.New("unsupported native transfer action")
++		return migrationdisk.Result{}, errors.New("unsupported native transfer action")
+ 	}
+ 	return p.migrationDiskRPC(ctx, q, in, out)
+ }
+diff --git a/internal/provision/provision_test.go b/internal/provision/provision_test.go
+index 671089d..9a4cc4a 100644
+--- a/internal/provision/provision_test.go
++++ b/internal/provision/provision_test.go
+@@ -32,6 +32,7 @@ import (
+ 	"srv/internal/config"
+ 	"srv/internal/format"
+ 	"srv/internal/host"
++	"srv/internal/migrationdisk"
+ 	"srv/internal/model"
+ 	"srv/internal/nethelper"
+ 	"srv/internal/storage"
+@@ -740,7 +741,7 @@ func TestExportAndImportPortableArtifact(t *testing.T) {
+ 	// The public portable path must never turn an uploaded manifest into a
+ 	// privileged native-disk publication request, even for a valid archive.
+ 	nativeManifest := manifest
+-	nativeManifest.NativeDisk = &vmrunner.MigrationDisk{}
++	nativeManifest.NativeDisk = &migrationdisk.Transfer{}
+ 	nativeStream := portableArtifactTestStream(t, nativeManifest, nil)
+ 	if _, _, err := dest.ImportInstance(ctx, model.Actor{}, bytes.NewReader(nativeStream)); err == nil || !strings.Contains(err.Error(), "trusted-frontend") {
+ 		t.Fatalf("public import accepted native metadata: %v", err)
+diff --git a/internal/service/forward_test.go b/internal/service/forward_test.go
+index b0cfaa9..caf001b 100644
+--- a/internal/service/forward_test.go
++++ b/internal/service/forward_test.go
+@@ -30,6 +30,7 @@ import (
+ 	"srv/internal/config"
+ 	"srv/internal/front"
+ 	"srv/internal/host"
++	"srv/internal/migrationdisk"
+ 	"srv/internal/model"
+ 	"srv/internal/provision"
+ 	"srv/internal/storage"
+@@ -169,12 +170,12 @@ func TestFrontendColdMigrationOverSSH(t *testing.T) {
+ 			}
+ 			_ = json.NewEncoder(w).Encode(vmrunner.ColdStatus{Phase: "hot", Remote: false, JournalPresent: false})
+ 		case "/vm/migration-disk-v1":
+-			var q vmrunner.MigrationDiskRequest
++			var q migrationdisk.Request
+ 			if err := json.Unmarshal([]byte(r.Header.Get("X-Srv-Migration")), &q); err != nil {
+ 				http.Error(w, err.Error(), 400)
+ 				return
+ 			}
+-			result := vmrunner.MigrationDiskResult{SerializedPayload: true}
++			result := migrationdisk.Result{SerializedPayload: true}
+ 			switch q.Action {
+ 			case "check", "cleanup", "discard":
+ 			case "prepare":
+diff --git a/internal/service/migration.go b/internal/service/migration.go
+index 59b9a05..d6eb46f 100644
+--- a/internal/service/migration.go
++++ b/internal/service/migration.go
+@@ -9,8 +9,8 @@ import (
+ 
+ 	gssh "github.com/gliderlabs/ssh"
+ 
++	"srv/internal/migrationdisk"
+ 	"srv/internal/model"
+-	"srv/internal/vmrunner"
+ )
+ 
+ // handleMigrationDisk is reachable only after trusted-node forwarding checks.
+@@ -23,7 +23,7 @@ func (a *App) handleMigrationDisk(sess gssh.Session, actor model.Actor, args []s
+ 		return 2, fmt.Errorf("invalid internal migration command")
+ 	}
+ 	data, err := base64.RawURLEncoding.DecodeString(args[1])
+-	var q vmrunner.MigrationDiskRequest
++	var q migrationdisk.Request
+ 	if err != nil || json.Unmarshal(data, &q) != nil {
+ 		return 2, fmt.Errorf("invalid migration request")
+ 	}
+diff --git a/internal/storage/disk_space.go b/internal/storage/disk_space.go
+index d673e21..e847ee9 100644
+--- a/internal/storage/disk_space.go
++++ b/internal/storage/disk_space.go
+@@ -30,5 +30,5 @@ func CheckDiskSpace(path string, payload int64) error {
+ 	if fs.Bsize <= 0 || fs.Bavail > uint64(math.MaxInt64)/uint64(fs.Bsize) {
+ 		return fmt.Errorf("invalid available disk measurement at %s", path)
+ 	}
+-	return CheckAvailableSpace(int64(fs.Bavail)*fs.Bsize, payload)
++	return CheckAvailableSpace(int64(fs.Bavail)*int64(fs.Bsize), payload)
+ }
+diff --git a/internal/storage/open_linux.go b/internal/storage/open_linux.go
+new file mode 100644
+index 0000000..b4de3ad
+--- /dev/null
++++ b/internal/storage/open_linux.go
+@@ -0,0 +1,56 @@
++package storage
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"golang.org/x/sys/unix"
++)
++
++// OpenNoSymlinks opens a clean absolute path, pinning each directory
++// before opening its child. Unlike openat2, openat works with systemd's
++// RestrictSUIDSGID filter; O_NOFOLLOW still rejects symlinks at every component.
++func OpenNoSymlinks(path string, flags int) (*os.File, error) {
++	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
++		return nil, fmt.Errorf("storage path must be absolute and clean: %q", path)
++	}
++	if path == "/" {
++		fd, err := unix.Open(path, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
++		if err != nil {
++			return nil, err
++		}
++		return os.NewFile(uintptr(fd), path), nil
++	}
++	fd, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
++	if err != nil {
++		return nil, err
++	}
++	parts := strings.Split(path[1:], "/")
++	for i, part := range parts {
++		openFlags := unix.O_PATH | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
++		if i == len(parts)-1 {
++			openFlags = flags | unix.O_NOFOLLOW | unix.O_CLOEXEC
++		}
++		next, err := unix.Openat(fd, part, openFlags, 0)
++		unix.Close(fd)
++		if err != nil {
++			return nil, err
++		}
++		fd = next
++	}
++	// O_PATH|O_NOFOLLOW opens the symlink inode itself instead of rejecting it.
++	if flags&unix.O_PATH != 0 {
++		var st unix.Stat_t
++		if err := unix.Fstat(fd, &st); err != nil {
++			unix.Close(fd)
++			return nil, err
++		}
++		if st.Mode&unix.S_IFMT == unix.S_IFLNK {
++			unix.Close(fd)
++			return nil, unix.ELOOP
++		}
++	}
++	return os.NewFile(uintptr(fd), path), nil
++}
+diff --git a/internal/storage/open_other.go b/internal/storage/open_other.go
+new file mode 100644
+index 0000000..de6369d
+--- /dev/null
++++ b/internal/storage/open_other.go
+@@ -0,0 +1,14 @@
++//go:build !linux
++
++package storage
++
++import (
++	"errors"
++	"os"
++)
++
++// OpenNoSymlinks relies on Linux O_PATH directory pinning. Other platforms
++// build this package only for shared types (srv-front), never to touch storage.
++func OpenNoSymlinks(path string, flags int) (*os.File, error) {
++	return nil, errors.ErrUnsupported
++}
+diff --git a/internal/storage/subvolume.go b/internal/storage/subvolume.go
+index 9e19595..18d9f3b 100644
+--- a/internal/storage/subvolume.go
++++ b/internal/storage/subvolume.go
+@@ -94,52 +94,6 @@ type subvolumeInfo struct {
+ 
+ const getSubvolumeInfo = uintptr(0x80000000 | (unsafe.Sizeof(subvolumeInfo{}) << 16) | (0x94 << 8) | 60)
+ 
+-// OpenNoSymlinks opens a clean absolute path, pinning each directory
+-// before opening its child. Unlike openat2, openat works with systemd's
+-// RestrictSUIDSGID filter; O_NOFOLLOW still rejects symlinks at every component.
+-func OpenNoSymlinks(path string, flags int) (*os.File, error) {
+-	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+-		return nil, fmt.Errorf("storage path must be absolute and clean: %q", path)
+-	}
+-	if path == "/" {
+-		fd, err := unix.Open(path, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+-		if err != nil {
+-			return nil, err
+-		}
+-		return os.NewFile(uintptr(fd), path), nil
+-	}
+-	fd, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+-	if err != nil {
+-		return nil, err
+-	}
+-	parts := strings.Split(path[1:], "/")
+-	for i, part := range parts {
+-		openFlags := unix.O_PATH | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+-		if i == len(parts)-1 {
+-			openFlags = flags | unix.O_NOFOLLOW | unix.O_CLOEXEC
+-		}
+-		next, err := unix.Openat(fd, part, openFlags, 0)
+-		unix.Close(fd)
+-		if err != nil {
+-			return nil, err
+-		}
+-		fd = next
+-	}
+-	// O_PATH|O_NOFOLLOW opens the symlink inode itself instead of rejecting it.
+-	if flags&unix.O_PATH != 0 {
+-		var st unix.Stat_t
+-		if err := unix.Fstat(fd, &st); err != nil {
+-			unix.Close(fd)
+-			return nil, err
+-		}
+-		if st.Mode&unix.S_IFMT == unix.S_IFLNK {
+-			unix.Close(fd)
+-			return nil, unix.ELOOP
+-		}
+-	}
+-	return os.NewFile(uintptr(fd), path), nil
+-}
+-
+ // FS_INFO's first 32 bytes identify the filesystem, independent of subvolume
+ // and mount aliases. The remaining ioctl fields are unused and zero-initialized.
+ type filesystemInfo struct {
+diff --git a/internal/vmrunner/cold_disk_test.go b/internal/vmrunner/cold_disk_test.go
+index c4320a2..40814c1 100644
+--- a/internal/vmrunner/cold_disk_test.go
++++ b/internal/vmrunner/cold_disk_test.go
+@@ -16,7 +16,9 @@ import (
+ 
+ 	"github.com/google/uuid"
+ 	"golang.org/x/sys/unix"
++
+ 	"srv/internal/coldstore"
++	"srv/internal/migrationdisk"
+ 	"srv/internal/storage"
+ )
+ 
+@@ -226,7 +228,7 @@ func TestPayloadWaitDoesNotBlockRunnerDrain(t *testing.T) {
+ 			data, _ := json.Marshal(q)
+ 			req := httptest.NewRequest(http.MethodPost, "/vm/cold-disk-v1", strings.NewReader(string(data)))
+ 			if action != "hydrate" {
+-				metadata, _ := json.Marshal(MigrationDiskRequest{Action: action, Name: q.Name, InstanceID: q.InstanceID, Token: uuid.NewString()})
++				metadata, _ := json.Marshal(migrationdisk.Request{Action: action, Name: q.Name, InstanceID: q.InstanceID, Token: uuid.NewString()})
+ 				req = httptest.NewRequest(http.MethodPost, "/vm/migration-disk-v1", nil)
+ 				req.Header.Set("X-Srv-Migration", string(metadata))
+ 			}
+@@ -588,7 +590,7 @@ func TestNativeMigrationSnapshotAndIncarnation(t *testing.T) {
+ 	id := f.ids[ino]
+ 	id.ParentUUID = base.UUID
+ 	f.ids[ino] = id
+-	q := MigrationDiskRequest{Action: "prepare", Name: f.q.Name, InstanceID: f.q.InstanceID, Token: uuid.NewString(), ExpectedDisk: id}
++	q := migrationdisk.Request{Action: "prepare", Name: f.q.Name, InstanceID: f.q.InstanceID, Token: uuid.NewString(), ExpectedDisk: id}
+ 	check := q
+ 	check.Action = "check"
+ 	// An incoming transfer owns this namespace flock until its stream ends.
+@@ -670,7 +672,7 @@ func TestNativeMigrationFilesystemIntegration(t *testing.T) {
+ 		code  int
+ 	}{{source, http.StatusOK}, {other, http.StatusConflict}} {
+ 		s.config.MigrationStoreDir = tc.store
+-		q := MigrationDiskRequest{Action: "check", Name: "filesystem-check", InstanceID: uuid.NewString(), Token: uuid.NewString()}
++		q := migrationdisk.Request{Action: "check", Name: "filesystem-check", InstanceID: uuid.NewString(), Token: uuid.NewString()}
+ 		metadata, err := json.Marshal(q)
+ 		if err != nil {
+ 			t.Fatal(err)
+diff --git a/internal/vmrunner/migration_disk.go b/internal/vmrunner/migration_disk.go
+index 6fae204..8955c86 100644
+--- a/internal/vmrunner/migration_disk.go
++++ b/internal/vmrunner/migration_disk.go
+@@ -12,41 +12,20 @@ import (
+ 	"syscall"
+ 
+ 	"srv/internal/coldstore"
++	"srv/internal/migrationdisk"
+ 	"srv/internal/storage"
+ )
+ 
+-// MigrationDisk describes immutable transfer objects, not a space reservation.
+-// Base is retained at the destination; Disk is discarded after publication.
+-type MigrationDisk struct {
+-	Disk coldstore.Object  `json:"disk"`
+-	Base *coldstore.Object `json:"base,omitempty"`
+-}
+-
+-type MigrationDiskRequest struct {
+-	Action       string                    `json:"action"`
+-	Name         string                    `json:"name"`
+-	InstanceID   string                    `json:"instance_id"`
+-	Token        string                    `json:"token"`
+-	ExpectedDisk storage.SubvolumeIdentity `json:"expected_disk"`
+-	Transfer     MigrationDisk             `json:"transfer"`
+-}
+-
+-type MigrationDiskResult struct {
+-	Transfer          MigrationDisk `json:"transfer"`
+-	BasePresent       bool          `json:"base_present"`
+-	SerializedPayload bool          `json:"serialized_payload"`
+-}
+-
+ type migrationDiskReceipt struct {
+ 	InstanceID string                    `json:"instance_id"`
+-	Transfer   MigrationDisk             `json:"transfer"`
++	Transfer   migrationdisk.Transfer    `json:"transfer"`
+ 	LocalDisk  storage.SubvolumeIdentity `json:"local_disk"`
+ }
+ 
+ // MigrationDisk is an internal streaming RPC. Only the trusted frontend's
+ // migration path may supply its input through srv; public import never does.
+-func (c *Client) MigrationDisk(ctx context.Context, q MigrationDiskRequest, in io.Reader, out io.Writer) (MigrationDiskResult, error) {
+-	var result MigrationDiskResult
++func (c *Client) MigrationDisk(ctx context.Context, q migrationdisk.Request, in io.Reader, out io.Writer) (migrationdisk.Result, error) {
++	var result migrationdisk.Result
+ 	metadata, err := json.Marshal(q)
+ 	if err != nil {
+ 		return result, err
+@@ -81,7 +60,7 @@ func (c *Client) MigrationDisk(ctx context.Context, q MigrationDiskRequest, in i
+ 	return result, err
+ }
+ 
+-func (s *Server) migrationSource(q MigrationDiskRequest) string {
++func (s *Server) migrationSource(q migrationdisk.Request) string {
+ 	return filepath.Join(s.config.MigrationStoreDir, "sources", receiptKey(q.Name), q.Token)
+ }
+ 
+@@ -91,7 +70,7 @@ func (s *Server) migrationImportPath(name string) string {
+ }
+ 
+ func (s *Server) handleMigrationDisk(w http.ResponseWriter, r *http.Request) {
+-	var q MigrationDiskRequest
++	var q migrationdisk.Request
+ 	metadata := r.Header.Get("X-Srv-Migration")
+ 	if r.Method != http.MethodPost || len(metadata) > 8192 || json.Unmarshal([]byte(metadata), &q) != nil ||
+ 		!validName.MatchString(q.Name) || !canonicalColdUUID(q.InstanceID) || !canonicalColdUUID(q.Token) {
+@@ -149,7 +128,7 @@ func (s *Server) handleMigrationDisk(w http.ResponseWriter, r *http.Request) {
+ 	// Capability checks precede stopping/fencing the source and are valid while
+ 	// it is running. Every operation that touches its disk still requires idle.
+ 	if q.Action == "check" {
+-		_ = json.NewEncoder(w).Encode(MigrationDiskResult{SerializedPayload: true})
++		_ = json.NewEncoder(w).Encode(migrationdisk.Result{SerializedPayload: true})
+ 		return
+ 	}
+ 	if err = s.storageIdleLocked(q.Name); err != nil {
+@@ -173,8 +152,8 @@ func (s *Server) handleMigrationDisk(w http.ResponseWriter, r *http.Request) {
+ 	_ = json.NewEncoder(w).Encode(result)
+ }
+ 
+-func (s *Server) migrationDiskLocked(ctx context.Context, q MigrationDiskRequest, in io.Reader) (MigrationDiskResult, func(io.Writer) error, error) {
+-	var result MigrationDiskResult
++func (s *Server) migrationDiskLocked(ctx context.Context, q migrationdisk.Request, in io.Reader) (migrationdisk.Result, func(io.Writer) error, error) {
++	var result migrationdisk.Result
+ 	root := s.config.MigrationStoreDir
+ 	disk := filepath.Join(s.config.InstancesDir, q.Name, "disk")
+ 	source := s.migrationSource(q)
+diff --git a/internal/vmrunner/payload_integration_test.go b/internal/vmrunner/payload_integration_test.go
+index 5cec485..f42032e 100644
+--- a/internal/vmrunner/payload_integration_test.go
++++ b/internal/vmrunner/payload_integration_test.go
+@@ -15,7 +15,9 @@ import (
+ 	"time"
+ 
+ 	"github.com/google/uuid"
++
+ 	"srv/internal/coldstore"
++	"srv/internal/migrationdisk"
+ 	"srv/internal/storage"
+ )
+ 
+@@ -184,8 +186,8 @@ func TestPayloadBtrfsRunnerIntegration(t *testing.T) {
+ 	if err := coldstore.Send(ctx, object, snapshot, "", &stream); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	q := MigrationDiskRequest{Name: "native-target", InstanceID: uuid.NewString(), Token: token, Action: "receive-disk", Transfer: MigrationDisk{Disk: object}}
+-	invoke := func(ctx context.Context, q MigrationDiskRequest, payload *bytes.Reader) *httptest.ResponseRecorder {
++	q := migrationdisk.Request{Name: "native-target", InstanceID: uuid.NewString(), Token: token, Action: "receive-disk", Transfer: migrationdisk.Transfer{Disk: object}}
++	invoke := func(ctx context.Context, q migrationdisk.Request, payload *bytes.Reader) *httptest.ResponseRecorder {
+ 		t.Helper()
+ 		wire, _ := json.Marshal(q)
+ 		req := httptest.NewRequest("POST", "/vm/migration-disk-v1", payload).WithContext(ctx)
+-- 
+2.56.0
+

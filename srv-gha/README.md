@@ -198,13 +198,14 @@ idle runners after a rebuild with `garm-cli runner rm <name>`.
 ## srv
 
 Run upstream srv (`SRV_SRC_DIR` in `site.env`; https://github.com/HeavyHorst/srv)
-at or after the revision named in the top-level README ("srv version").
+at or after the revision named in the top-level README ("srv version"), plus
+the patches in `../host/srv/patches/` ("srv patches" there).
 When upgrading srv:
 
 1. Disable the pools and remove the idle runners.
 2. Back up `/var/lib/srv/state`, `/etc/srv` and `/srv/jail/.start-receipts`.
 3. Update `SRV_SRC_DIR` to the new upstream revision, run
-   `sudo ./contrib/systemd/install.sh` there, and restart `srv-net-helper`,
-   `srv-vm-runner` and `srv`.
+   `../host/srv/apply-patches.sh`, then `sudo ./contrib/systemd/install.sh` in
+   `SRV_SRC_DIR`, and restart `srv-net-helper`, `srv-vm-runner` and `srv`.
 4. Rebuild and install `srv-orb-dispatch` (see `../srv-orbs`), then re-enable
    the pools.
