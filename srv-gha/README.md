@@ -100,22 +100,23 @@ adding them to the App installation.
 Each org or repo gets one pool, for example:
 
 - Flavor `6c-12g-30g`, image `$GHA_RUNNER_IMAGE`.
-- Max 4 runners, 1 warm idle runner.
+- Max 4 runners, no warm idle runner (`--min-idle-runners 0`): a runner VM
+  starts when a job is queued, so each job waits for one VM boot.
 - Labels `self-hosted, linux, x64, bazel, srv`.
 
 GARM caps each pool separately; orgs cannot share one limit. Size the pools
 against srv's memory budget and physical cores: with two orgs at these
 settings, CI can reserve 8 × 12 GiB = 96 GiB and 48 vCPUs, and once busy
 runners outnumber physical cores CPU-bound steps slow down markedly (~2× was
-measured on a 28-core host). Each warm idle runner keeps its memory reserved
-even when no jobs are running.
+measured on a 28-core host). A warm idle runner (`--min-idle-runners 1`)
+saves that boot but keeps its memory reserved even when no jobs are running.
 
 The image mounts `/` with `barrier=0`: runner disks are discarded after each
 job, and with barriers every guest fsync cost ~17 ms of host flushing.
 
 ```sh
 garm-cli pool list
-garm-cli pool update <id> --max-runners 4 --min-idle-runners 1 --flavor 6c-12g-30g
+garm-cli pool update <id> --max-runners 4 --min-idle-runners 0 --flavor 6c-12g-30g
 garm-cli runner list
 ```
 
