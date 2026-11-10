@@ -3,5 +3,6 @@
 *.env
 !*.env.example
 /site.env
+/.env.*
 rendered/
 /srv-gha/garm-provider-srv/garm-provider-srv
