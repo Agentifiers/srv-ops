@@ -1,0 +1,71 @@
+# Public HTTPS relay (Coolify "cliproxy-relay" service on a public server).
+# Coolify's proxy terminates TLS for the service's domains and forwards to
+# Caddy on :8080; Caddy reaches this host over Tailscale through the sidecar's
+# SOCKS5 proxy (its HTTP proxy mangles requests).
+#   /webhooks/*  -> GARM            @SITE_HOST_TAILNET_IP@:@GARM_API_PORT@
+#   everything   -> CLIProxyAPI     @SITE_HOST_TAILNET_IP@:8318 (`tailscale serve --tcp 8318 tcp://127.0.0.1:8317`)
+# Render: . common/site-env.sh; site_env_load SITE_HOST_TAILNET_IP GARM_API_PORT; site_env_render host/relay/compose.yaml.example
+# TS_AUTHKEY is a Coolify service variable (a single-use tag:srv key).
+services:
+  cliproxy-ts:
+    image: 'tailscale/tailscale:latest'
+    hostname: cliproxy-relay
+    environment:
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_HOSTNAME: cliproxy-relay
+      TS_USERSPACE: 'true'
+      TS_AUTH_ONCE: 'true'
+      TS_AUTHKEY: '${TS_AUTHKEY}'
+      TS_EXTRA_ARGS: '--advertise-tags=tag:srv'
+      TS_SOCKS5_SERVER: '0.0.0.0:1055'
+    volumes:
+      - 'cliproxy-ts-state:/var/lib/tailscale'
+    restart: unless-stopped
+  cliproxy-relay:
+    image: 'caddy:2-alpine'
+    restart: unless-stopped
+    expose:
+      - '8080'
+    depends_on:
+      - cliproxy-ts
+    configs:
+      -
+        source: caddyfile
+        target: /etc/caddy/Caddyfile
+configs:
+  caddyfile:
+    content: |
+      {
+        admin off
+        auto_https off
+        servers {
+          trusted_proxies static private_ranges
+        }
+      }
+      :8080 {
+        handle /webhooks/* {
+          reverse_proxy http://@SITE_HOST_TAILNET_IP@:@GARM_API_PORT@ {
+            header_down X-Relay-Upstream tailnet
+            transport http {
+              forward_proxy_url socks5://cliproxy-ts:1055
+              dial_timeout 10s
+            }
+          }
+        }
+        handle /__relay {
+          respond "relay ok proto={http.request.header.X-Forwarded-Proto} host={host}" 200
+        }
+        handle {
+          reverse_proxy http://@SITE_HOST_TAILNET_IP@:8318 {
+            flush_interval -1
+            header_down X-Relay-Upstream tailnet
+            transport http {
+              forward_proxy_url socks5://cliproxy-ts:1055
+              dial_timeout 10s
+              keepalive 60s
+            }
+          }
+        }
+      }
+volumes:
+  cliproxy-ts-state: {}

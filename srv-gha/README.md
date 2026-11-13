@@ -8,7 +8,7 @@ deleted. The VMs are completely separate from the Amp orb setup in
 (`$SITE_TAG_GHA`, default `tag:gha`, srv's default guest tag), and a separate set of VM names (`gha-*`).
 
 ```
-GitHub ──webhook──> Funnel :FUNNEL/webhooks ──> garm (HOST_IP:GARM_API)
+GitHub ──webhook──> relay (host/relay) /webhooks ──tailnet──> garm (HOST_IP:GARM_API)
                                                │ GARM_COMMAND=CreateInstance
                                                v
                                garm-provider-srv ──ssh SRV_HOST new gha-… --image GHA_RUNNER_IMAGE
@@ -17,7 +17,7 @@ GitHub ──webhook──> Funnel :FUNNEL/webhooks ──> garm (HOST_IP:GARM_A
                        runner VM (SITE_TAG_GHA) ──> metadata/callback :GARM_API, bazel-remote :GRPC
 ```
 
-Uppercase names refer to `site.env` settings (`GARM_WEBHOOK_FUNNEL_PORT`,
+Uppercase names refer to `site.env` settings (`GARM_WEBHOOK_BASE_URL`,
 `SITE_HOST_TAILNET_IP`, `GARM_API_PORT`, `BAZEL_REMOTE_GRPC_PORT`, ...).
 
 ## Components
@@ -29,7 +29,7 @@ Uppercase names refer to `site.env` settings (`GARM_WEBHOOK_FUNNEL_PORT`,
 | Runner image builder | `build-image.sh` → `$SRV_IMAGES_DIR/$GHA_RUNNER_IMAGE/` (registered in `/etc/srv/images.json`). Guests get `SRV_GUEST_AUTH_TAGS=$SITE_TAG_GHA` |
 | Provider | `garm-provider-srv/` → `/usr/local/lib/garm/garm-provider-srv`, config `garm/provider-srv.toml` (`srv_host = $SRV_HOST`, `default_image = $GHA_RUNNER_IMAGE`) rendered to `/etc/garm/provider-srv.toml` |
 | GARM v0.2.1 | `/usr/local/bin/garm{,-cli}`, `systemd/garm.service` (user `garm`), `garm/config.toml.example` → rendered to `/etc/garm/config.toml` (fill in the JWT secret and DB passphrase), DB `/var/lib/garm/garm.db` |
-| Webhook ingress | `tailscale funnel` on `:$GARM_WEBHOOK_FUNNEL_PORT`, path `/webhooks` only (the API and UI are not exposed) |
+| Webhook ingress | `../host/relay`: a public HTTPS relay that forwards only `/webhooks/*` over Tailscale to GARM (the API and UI are not exposed). GitHub gives up on a delivery after 10 s, and GARM creates runners only from `queued` deliveries; Tailscale Funnel took 7–8 s per delivery and lost jobs, so it is no longer used. |
 | Bazel cache | bazel-remote v2.6.4, `systemd/bazel-remote.service`, btrfs subvolume `$BAZEL_REMOTE_DIR` (excluded from snapper root snapshots, compression off), max `$BAZEL_REMOTE_MAX_SIZE_GIB` GiB, gRPC `$SITE_HOST_TAILNET_IP:$BAZEL_REMOTE_GRPC_PORT`, HTTP `:$BAZEL_REMOTE_HTTP_PORT` |
 | Secrets | Keep the GARM admin credentials, bazel-remote's `ci` password, and the GitHub App private keys (`*.pem`) outside the repo in a 0600 directory of the admin user, e.g. `~/.config/srv-gha/` |
 
@@ -55,7 +55,7 @@ app webhook; GARM installs its own org webhooks.
 ```sh
 . ../site.env
 garm-cli controller update \
-  --webhook-url "https://$SITE_HOST_TS_NAME.$SITE_TAILNET_DNS:$GARM_WEBHOOK_FUNNEL_PORT/webhooks" \
+  --webhook-url "$GARM_WEBHOOK_BASE_URL" \
   --metadata-url "http://$SITE_HOST_TAILNET_IP:$GARM_API_PORT/api/v1/metadata" \
   --callback-url "http://$SITE_HOST_TAILNET_IP:$GARM_API_PORT/api/v1/callbacks"
 garm-cli github credentials add --name <org>-app --auth-type app \
@@ -65,8 +65,10 @@ garm-cli github credentials add --name <org>-app --auth-type app \
 garm-cli org add --name <org> --credentials <org>-app --install-webhook --random-webhook-secret
 ```
 
-Expose only the webhook path publicly:
-`tailscale funnel --bg --https $GARM_WEBHOOK_FUNNEL_PORT --set-path /webhooks http://$SITE_HOST_TAILNET_IP:$GARM_API_PORT/webhooks`.
+GitHub reaches GARM only through the relay (`../host/relay`), which serves
+`/webhooks/*` and nothing else. A job whose `queued` delivery failed stays queued
+until that delivery is redelivered (org or repo **Settings → Webhooks → Recent
+Deliveries → Redeliver**); GARM does not poll GitHub for queued jobs.
 
 ### Repositories owned by a user account
 
