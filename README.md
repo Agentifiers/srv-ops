@@ -86,6 +86,36 @@ cd "$SRV_SRC_DIR" && sudo ./contrib/systemd/install.sh
 Delete a patch once upstream has merged it; `apply-patches.sh` then reports
 it as already applied, or stops because it no longer applies.
 
+## Multi-host frontend (srv-front)
+
+`srv-front` runs on `winstons-mac-mini` as the LaunchDaemon `system/srv-front`
+(role account `_srvfront`). It joins the tailnet as its own `tag:srv` node,
+`srv-front`, so `ssh srv-front …` reaches every backend while `ssh srv …` still
+goes straight to this host. Setup follows "Run on macOS" in srv's
+`docs/getting-started/multi-host.md`.
+
+| Piece | Where |
+|---|---|
+| Binary | `/usr/local/bin/srv-front` (darwin/arm64) |
+| Config | `/usr/local/etc/srv-front.json`: `hostname` `srv-front`, `allowed_users` (same as the backend's `SRV_ALLOWED_USERS`), and one `hosts` entry per backend with its pinned SSH host key (`sudo journalctl -u srv \| grep 'ssh host key'`) |
+| State | `/usr/local/var/srv-front` (tailnet identity and SSH host key; 0700 `_srvfront`) |
+| Log | `/usr/local/var/log/srv-front.log` |
+| Backend trust | `SRV_TRUSTED_FRONTENDS=<frontend stable node ID>` in `/etc/srv/srv.env` on each backend, then restart `srv` |
+
+Build the frontend from **the same srv revision as the backends**: the router
+forwards commands, and a newer frontend sends ones an older backend doesn't
+know. On an upstream revision the patch above applies; on older ones it may
+not, and only its `internal/host/host.go` change (`unix.Uname`) is needed for
+`srv-front` to build for darwin. After upgrading srv:
+
+```sh
+GOOS=darwin GOARCH=arm64 go build -o srv-front ./cmd/srv-front   # in SRV_SRC_DIR, patched
+scp srv-front winston@winstons-mac-mini:
+# on the Mac:
+sudo install -m 0755 ~/srv-front /usr/local/bin/srv-front
+sudo launchctl kickstart -k system/srv-front
+```
+
 ## Backups
 
 Back these up together: `/var/lib/srv/state`, `/srv/jail/.start-receipts`,
