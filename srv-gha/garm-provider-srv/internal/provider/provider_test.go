@@ -272,6 +272,71 @@ func TestStartStop(t *testing.T) {
 	}
 }
 
+func TestProviderBehindFrontend(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeSrv()
+	f.front = true
+	p := testProvider(t, f)
+	if _, err := p.CreateInstance(ctx, bootstrap("garm-front")); err != nil {
+		t.Fatal(err)
+	}
+	id := ProviderID("garm-front")
+	rec, err := p.store.Get(id)
+	if err != nil || rec.Host != "a" {
+		t.Fatalf("record = %+v, %v; want host a", rec, err)
+	}
+	if !f.called("--json", "inspect", "a/"+id) {
+		t.Fatalf("readiness was not checked by host/name: %v", f.calls)
+	}
+
+	// Another backend goes down: this runner stays fully manageable through
+	// its recorded host, and listing refuses to guess.
+	f.hostDown = true
+	if inst, err := p.GetInstance(ctx, id); err != nil || inst.Status != commonParams.InstanceRunning {
+		t.Fatalf("GetInstance with b down = %+v, %v", inst, err)
+	}
+	if insts, err := p.ListInstances(ctx, "pool1"); err == nil {
+		t.Fatalf("ListInstances with b down = %+v, want error", insts)
+	}
+	if _, err := p.store.Get(id); err != nil {
+		t.Fatalf("record pruned while a host was unreachable: %v", err)
+	}
+	if err := p.DeleteInstance(ctx, id); err != nil {
+		t.Fatalf("DeleteInstance with b down = %v", err)
+	}
+	if _, ok := f.instances[id]; ok {
+		t.Fatal("VM not deleted")
+	}
+	if _, err := p.store.Get(id); !errors.Is(err, errRecordNotFound) {
+		t.Fatalf("record after delete = %v", err)
+	}
+}
+
+// Runners created before srv_host pointed at srv-front have no host in their
+// record; their bare names resolve while every host answers.
+func TestHostlessRecordBehindFrontend(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeSrv()
+	p := testProvider(t, f)
+	if _, err := p.CreateInstance(ctx, bootstrap("garm-old")); err != nil {
+		t.Fatal(err)
+	}
+	id := ProviderID("garm-old")
+	if rec, _ := p.store.Get(id); rec.Host != "" {
+		t.Fatalf("direct backend recorded host %q", rec.Host)
+	}
+	f.front = true
+	if insts, err := p.ListInstances(ctx, "pool1"); err != nil || len(insts) != 1 || insts[0].ProviderID != id {
+		t.Fatalf("ListInstances = %+v, %v", insts, err)
+	}
+	if err := p.Stop(ctx, id, false); err != nil || f.instances[id].State != srvStateStopped {
+		t.Fatalf("Stop = %v, state %s", err, f.instances[id].State)
+	}
+	if err := p.DeleteInstance(ctx, id); err != nil {
+		t.Fatalf("DeleteInstance = %v", err)
+	}
+}
+
 func TestValidatePoolInfo(t *testing.T) {
 	p := testProvider(t, newFakeSrv())
 	ctx := context.Background()

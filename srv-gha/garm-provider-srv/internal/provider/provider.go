@@ -138,7 +138,11 @@ func (p *Provider) CreateInstance(ctx context.Context, bp commonParams.Bootstrap
 	}()
 
 	if _, err := p.store.Get(id); err == nil {
-		switch _, err := p.srv.Inspect(ctx, id); {
+		target, err := p.target(id)
+		if err != nil {
+			return commonParams.ProviderInstance{}, err
+		}
+		switch _, err := p.srv.Inspect(ctx, target); {
 		case err == nil:
 			return commonParams.ProviderInstance{}, fmt.Errorf("instance %s (%s): %w", bp.Name, id, garmErrors.ErrDuplicateEntity)
 		case !errors.Is(err, errSrvNotFound):
@@ -162,7 +166,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bp commonParams.Bootstrap
 		return commonParams.ProviderInstance{}, err
 	}
 
-	inst, err := p.provision(ctx, id, image, flavor, script)
+	inst, err := p.provision(ctx, &rec, image, flavor, script)
 	if err != nil {
 		cleanupErr := p.cleanupFailedCreate(ctx, id)
 		if cleanupErr == nil {
@@ -191,13 +195,21 @@ func (p *Provider) CreateInstance(ctx context.Context, bp commonParams.Bootstrap
 }
 
 // provision runs srv new and bootstraps the runner. Any error means the VM
-// must be torn down.
-func (p *Provider) provision(ctx context.Context, id, image string, flavor Flavor, script []byte) (SrvInstance, error) {
+// must be torn down. Behind srv-front the VM's host is recorded as soon as it
+// is listed, so later calls (and cleanup) address host/name.
+func (p *Provider) provision(ctx context.Context, rec *Record, image string, flavor Flavor, script []byte) (SrvInstance, error) {
+	id := rec.ProviderID
 	if err := p.srv.New(ctx, id, image, flavor); err != nil {
 		return SrvInstance{}, fmt.Errorf("srv new: %w", err)
 	}
-	inst, err := p.waitReady(ctx, id)
+	if err := p.recordHost(ctx, rec); err != nil {
+		return SrvInstance{}, err
+	}
+	inst, err := p.waitReady(ctx, Target(id, rec.Host))
 	if err != nil {
+		return SrvInstance{}, err
+	}
+	if err := p.recordHost(ctx, rec); err != nil {
 		return SrvInstance{}, err
 	}
 	if err := p.waitGuestSSH(ctx, id); err != nil {
@@ -209,12 +221,45 @@ func (p *Provider) provision(ctx context.Context, id, image string, flavor Flavo
 	return inst, nil
 }
 
+// recordHost stores the srv-front host of rec's VM once srv lists it. A
+// failed lookup is left for the next attempt: bare names still resolve while
+// every host answers. Only a failure to persist a found host is an error.
+func (p *Provider) recordHost(ctx context.Context, rec *Record) error {
+	if rec.Host != "" {
+		return nil
+	}
+	host, err := p.srv.Locate(ctx, rec.ProviderID)
+	if err != nil || host == "" {
+		return nil
+	}
+	rec.Host = host
+	return p.store.Put(*rec)
+}
+
+// target is how srv commands address instance id: host/id when its record
+// knows the srv-front host, else id.
+func (p *Provider) target(id string) (string, error) {
+	rec, err := p.store.Get(id)
+	switch {
+	case err == nil:
+		return Target(id, rec.Host), nil
+	case errors.Is(err, errRecordNotFound):
+		return id, nil
+	default:
+		return "", err
+	}
+}
+
 func (p *Provider) cleanupFailedCreate(ctx context.Context, id string) error {
 	// ctx may already be cancelled (GARM shutting down); cleanup still runs.
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 	defer cancel()
-	if err := p.srv.Delete(cctx, id); err != nil && !errors.Is(err, errSrvNotFound) {
-		return fmt.Errorf("srv delete %s: %w", id, err)
+	target, err := p.target(id)
+	if err != nil {
+		return err
+	}
+	if err := p.srv.Delete(cctx, target); err != nil && !errors.Is(err, errSrvNotFound) {
+		return fmt.Errorf("srv delete %s: %w", target, err)
 	}
 	return p.store.Delete(id)
 }
@@ -228,27 +273,27 @@ func (p *Provider) sleep(ctx context.Context) error {
 	}
 }
 
-func (p *Provider) waitReady(ctx context.Context, id string) (SrvInstance, error) {
+func (p *Provider) waitReady(ctx context.Context, target string) (SrvInstance, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.ReadyTimeout.Duration)
 	defer cancel()
 	last := "unknown"
 	for {
-		inst, err := p.srv.Inspect(ctx, id)
+		inst, err := p.srv.Inspect(ctx, target)
 		switch {
 		case errors.Is(err, errSrvNotFound):
-			return SrvInstance{}, fmt.Errorf("instance %s disappeared while waiting for ready", id)
+			return SrvInstance{}, fmt.Errorf("instance %s disappeared while waiting for ready", target)
 		case err != nil:
 			// Transient ssh/srv failures are retried until the deadline.
 			last = err.Error()
 		case inst.State == srvStateReady:
 			return inst, nil
 		case inst.State == srvStateFailed || inst.State == srvStateDeleting || inst.State == srvStateDeleted:
-			return SrvInstance{}, fmt.Errorf("instance %s is %s: %s (see: ssh %s logs %s serial)", id, inst.State, inst.LastError, p.cfg.SrvHost, id)
+			return SrvInstance{}, fmt.Errorf("instance %s is %s: %s (see: ssh %s logs %s serial)", target, inst.State, inst.LastError, p.cfg.SrvHost, target)
 		default:
 			last = "state " + inst.State
 		}
 		if err := p.sleep(ctx); err != nil {
-			return SrvInstance{}, fmt.Errorf("timed out after %s waiting for %s to become ready (last: %s)", p.cfg.ReadyTimeout, id, last)
+			return SrvInstance{}, fmt.Errorf("timed out after %s waiting for %s to become ready (last: %s)", p.cfg.ReadyTimeout, target, last)
 		}
 	}
 }
@@ -341,9 +386,14 @@ func (p *Provider) DeleteInstance(ctx context.Context, instance string) error {
 	if err != nil {
 		return err
 	}
-	if err := p.srv.Delete(ctx, id); err != nil && !errors.Is(err, errSrvNotFound) {
+	target, err := p.target(id)
+	if err != nil {
 		lock.Unlock()
-		return fmt.Errorf("deleting %s: %w", id, err)
+		return err
+	}
+	if err := p.srv.Delete(ctx, target); err != nil && !errors.Is(err, errSrvNotFound) {
+		lock.Unlock()
+		return fmt.Errorf("deleting %s: %w", target, err)
 	}
 	if err := p.store.Delete(id); err != nil {
 		lock.Unlock()
@@ -355,7 +405,11 @@ func (p *Provider) DeleteInstance(ctx context.Context, instance string) error {
 
 func (p *Provider) GetInstance(ctx context.Context, instance string) (commonParams.ProviderInstance, error) {
 	id := ResolveID(instance)
-	inst, err := p.srv.Inspect(ctx, id)
+	target, err := p.target(id)
+	if err != nil {
+		return commonParams.ProviderInstance{}, err
+	}
+	inst, err := p.srv.Inspect(ctx, target)
 	if errors.Is(err, errSrvNotFound) || (err == nil && inst.State == srvStateDeleted) {
 		return commonParams.ProviderInstance{}, fmt.Errorf("instance %s (%s): %w", instance, id, garmErrors.ErrNotFound)
 	}
@@ -418,7 +472,12 @@ func (p *Provider) pruneIfGone(ctx context.Context, id string) error {
 		return err
 	}
 	// Re-check under the lock: a create may have finished since srv list.
-	inst, err := p.srv.Inspect(ctx, id)
+	target, err := p.target(id)
+	if err != nil {
+		lock.Unlock()
+		return err
+	}
+	inst, err := p.srv.Inspect(ctx, target)
 	if err == nil && inst.State != srvStateDeleted {
 		lock.Unlock()
 		return nil
@@ -452,19 +511,24 @@ func (p *Provider) RemoveAllInstances(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// inspectExisting returns the srv target of instance and its current state.
 func (p *Provider) inspectExisting(ctx context.Context, instance string) (string, SrvInstance, error) {
 	id := ResolveID(instance)
-	inst, err := p.srv.Inspect(ctx, id)
-	if errors.Is(err, errSrvNotFound) || (err == nil && inst.State == srvStateDeleted) {
-		return id, SrvInstance{}, fmt.Errorf("instance %s (%s): %w", instance, id, garmErrors.ErrNotFound)
+	target, err := p.target(id)
+	if err != nil {
+		return "", SrvInstance{}, err
 	}
-	return id, inst, err
+	inst, err := p.srv.Inspect(ctx, target)
+	if errors.Is(err, errSrvNotFound) || (err == nil && inst.State == srvStateDeleted) {
+		return target, SrvInstance{}, fmt.Errorf("instance %s (%s): %w", instance, target, garmErrors.ErrNotFound)
+	}
+	return target, inst, err
 }
 
 // Stop stops the VM; already stopped/stopping is success. srv stop is always
 // a graceful shutdown, so force is ignored.
 func (p *Provider) Stop(ctx context.Context, instance string, _ bool) error {
-	id, inst, err := p.inspectExisting(ctx, instance)
+	target, inst, err := p.inspectExisting(ctx, instance)
 	if err != nil {
 		return err
 	}
@@ -472,23 +536,23 @@ func (p *Provider) Stop(ctx context.Context, instance string, _ bool) error {
 	case srvStateStopped, srvStateStopping:
 		return nil
 	}
-	return p.srv.Stop(ctx, id)
+	return p.srv.Stop(ctx, target)
 }
 
 // Start starts a stopped VM, or asks srv to recheck one stuck in
 // awaiting-tailnet. Running or provisioning VMs are left alone.
 func (p *Provider) Start(ctx context.Context, instance string) error {
-	id, inst, err := p.inspectExisting(ctx, instance)
+	target, inst, err := p.inspectExisting(ctx, instance)
 	if err != nil {
 		return err
 	}
 	switch inst.State {
 	case srvStateStopped, srvStateAwaitingTailnet:
-		return p.srv.Start(ctx, id)
+		return p.srv.Start(ctx, target)
 	case srvStateReady, srvStateProvisioning:
 		return nil
 	default:
-		return fmt.Errorf("cannot start %s from state %s", id, inst.State)
+		return fmt.Errorf("cannot start %s from state %s", target, inst.State)
 	}
 }
 

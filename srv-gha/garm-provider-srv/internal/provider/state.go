@@ -22,6 +22,9 @@ type Record struct {
 	Image        string    `json:"image,omitempty"`
 	Flavor       string    `json:"flavor,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
+	// Host is the srv-front host the VM was placed on; empty with a single
+	// backend, or until srv-front lists the new VM.
+	Host string `json:"host,omitempty"`
 }
 
 var errRecordNotFound = errors.New("state record not found")

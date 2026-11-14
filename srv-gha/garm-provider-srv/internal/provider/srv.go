@@ -65,6 +65,8 @@ func ExecRunner(ctx context.Context, stdin []byte, name string, args ...string) 
 
 // SrvInstance is the subset of srv's instance JSON this provider uses. It
 // matches both `--json inspect` (.instance) and `--json list` (.instances[]).
+// Host is the srv-front host that reported the instance; it is empty when
+// srv_host is a single backend.
 type SrvInstance struct {
 	Name          string `json:"name"`
 	Image         string `json:"image"`
@@ -72,6 +74,17 @@ type SrvInstance struct {
 	TailscaleName string `json:"tailscale_name"`
 	TailscaleIP   string `json:"tailscale_ip"`
 	LastError     string `json:"last_error"`
+	Host          string `json:"-"`
+}
+
+// Target is the name srv commands address an instance by: host/name once the
+// instance's srv-front host is known, else the bare name, which a single
+// backend takes as is and srv-front resolves by asking every host.
+func Target(name, host string) string {
+	if host == "" {
+		return name
+	}
+	return host + "/" + name
 }
 
 // Srv talks to the srv control plane over ssh.
@@ -89,18 +102,22 @@ func (s *Srv) cmd(ctx context.Context, args ...string) ([]byte, error) {
 	return s.run(ctx, nil, "ssh", sshArgs...)
 }
 
-// notFound maps srv's "instance ... does not exist" failure to errSrvNotFound.
+// notFound maps a definite absence to errSrvNotFound: a backend's "instance
+// ... does not exist" (also when relayed by srv-front for host/name), or
+// srv-front's "resolves to 0 hosts", which it reports only after every host
+// answered. An unreachable host is an error, never absence.
 func notFound(err error) error {
 	var ce *CommandError
-	if errors.As(err, &ce) && strings.Contains(ce.Stderr, "does not exist") {
+	if errors.As(err, &ce) && (strings.Contains(ce.Stderr, "does not exist") || strings.Contains(ce.Stderr, "resolves to 0 hosts")) {
 		return fmt.Errorf("%w: %s", errSrvNotFound, strings.TrimSpace(ce.Stderr))
 	}
 	return err
 }
 
-// Inspect returns errSrvNotFound if srv does not know the instance.
-func (s *Srv) Inspect(ctx context.Context, name string) (SrvInstance, error) {
-	out, err := s.cmd(ctx, "--json", "inspect", name)
+// Inspect returns errSrvNotFound if srv does not know the instance. target
+// is a name or host/name (see Target).
+func (s *Srv) Inspect(ctx context.Context, target string) (SrvInstance, error) {
+	out, err := s.cmd(ctx, "--json", "inspect", target)
 	if err != nil {
 		return SrvInstance{}, notFound(err)
 	}
@@ -108,24 +125,66 @@ func (s *Srv) Inspect(ctx context.Context, name string) (SrvInstance, error) {
 		Instance SrvInstance `json:"instance"`
 	}
 	if err := json.Unmarshal(out, &resp); err != nil {
-		return SrvInstance{}, fmt.Errorf("decoding srv inspect %s: %w", name, err)
+		return SrvInstance{}, fmt.Errorf("decoding srv inspect %s: %w", target, err)
 	}
 	return resp.Instance, nil
 }
 
-// List returns all non-deleted instances visible to us.
+// List returns all non-deleted instances visible to us. srv_host may be a
+// single backend ({"instances":[...]}) or srv-front ({"hosts":[{"host",
+// "data":{"instances":[...]},"error"}]}); with srv-front every host must
+// answer, because a missing host's runners would otherwise look deleted.
 func (s *Srv) List(ctx context.Context) ([]SrvInstance, error) {
 	out, err := s.cmd(ctx, "--json", "list")
 	if err != nil {
 		return nil, err
 	}
 	var resp struct {
-		Instances []SrvInstance `json:"instances"`
+		Instances *[]SrvInstance `json:"instances"`
+		Hosts     []struct {
+			Host  string `json:"host"`
+			Error string `json:"error"`
+			Data  struct {
+				Instances *[]SrvInstance `json:"instances"`
+			} `json:"data"`
+		} `json:"hosts"`
 	}
 	if err := json.Unmarshal(out, &resp); err != nil {
 		return nil, fmt.Errorf("decoding srv list: %w", err)
 	}
-	return resp.Instances, nil
+	switch {
+	case resp.Instances != nil:
+		return *resp.Instances, nil
+	case len(resp.Hosts) > 0:
+		var all []SrvInstance
+		for _, h := range resp.Hosts {
+			if h.Error != "" || h.Host == "" || h.Data.Instances == nil {
+				return nil, fmt.Errorf("srv list: incomplete inventory from host %q: %s", h.Host, h.Error)
+			}
+			for _, inst := range *h.Data.Instances {
+				inst.Host = h.Host
+				all = append(all, inst)
+			}
+		}
+		return all, nil
+	default:
+		return nil, errors.New("srv list: response has neither instances nor hosts")
+	}
+}
+
+// Locate returns the srv-front host holding name, or "" when srv_host is a
+// single backend or name is not listed (yet).
+func (s *Srv) Locate(ctx context.Context, name string) (string, error) {
+	insts, err := s.List(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, inst := range insts {
+		if inst.Name == name {
+			return inst.Host, nil
+		}
+	}
+	return "", nil
 }
 
 func (s *Srv) New(ctx context.Context, name, image string, flavor Flavor) error {
@@ -135,18 +194,18 @@ func (s *Srv) New(ctx context.Context, name, image string, flavor Flavor) error 
 }
 
 // Delete returns errSrvNotFound if the instance does not exist.
-func (s *Srv) Delete(ctx context.Context, name string) error {
-	_, err := s.cmd(ctx, "delete", name)
+func (s *Srv) Delete(ctx context.Context, target string) error {
+	_, err := s.cmd(ctx, "delete", target)
 	return notFound(err)
 }
 
-func (s *Srv) Start(ctx context.Context, name string) error {
-	_, err := s.cmd(ctx, "start", name)
+func (s *Srv) Start(ctx context.Context, target string) error {
+	_, err := s.cmd(ctx, "start", target)
 	return notFound(err)
 }
 
-func (s *Srv) Stop(ctx context.Context, name string) error {
-	_, err := s.cmd(ctx, "stop", name)
+func (s *Srv) Stop(ctx context.Context, target string) error {
+	_, err := s.cmd(ctx, "stop", target)
 	return notFound(err)
 }
 

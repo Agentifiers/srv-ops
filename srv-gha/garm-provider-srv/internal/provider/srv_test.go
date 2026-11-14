@@ -49,6 +49,10 @@ type fakeSrv struct {
 	// guestDown makes guest ssh fail.
 	guestDown bool
 	installs  map[string][]byte
+	// front makes the fake answer like srv-front with one backend "a" in
+	// front of instances; hostDown adds a second, unreachable backend "b".
+	front    bool
+	hostDown bool
 }
 
 func newFakeSrv() *fakeSrv {
@@ -86,7 +90,59 @@ func (f *fakeSrv) run(_ context.Context, stdin []byte, name string, args ...stri
 	return nil, nil
 }
 
+// srvCmd answers like srv-front when f.front, else like a single backend.
 func (f *fakeSrv) srvCmd(args []string) ([]byte, error) {
+	if !f.front {
+		return f.backendCmd(args)
+	}
+	if len(args) == 2 && args[0] == "--json" && args[1] == "list" {
+		data, err := f.backendCmd(args)
+		if err != nil {
+			return nil, err
+		}
+		hosts := []string{fmt.Sprintf(`{"host":"a","data":%s}`, data)}
+		if f.hostDown {
+			hosts = append(hosts, `{"host":"b","error":"dial tcp 100.64.0.2:22: connection refused"}`)
+		}
+		return []byte(`{"hosts":[` + strings.Join(hosts, ",") + `]}`), nil
+	}
+	i := -1
+	switch {
+	case len(args) == 3 && args[0] == "--json" && args[1] == "inspect":
+		i = 2
+	case len(args) == 2 && (args[0] == "delete" || args[0] == "start" || args[0] == "stop"):
+		i = 1
+	}
+	if i >= 0 {
+		name, err := f.resolve(args[i])
+		if err != nil {
+			return nil, cmdErr(args, err.Error())
+		}
+		args = slices.Clone(args)
+		args[i] = name
+	}
+	return f.backendCmd(args)
+}
+
+// resolve mirrors srv-front: host/name goes to that host; a bare name needs
+// every host to answer and exactly one match.
+func (f *fakeSrv) resolve(target string) (string, error) {
+	if host, name, ok := strings.Cut(target, "/"); ok {
+		if host != "a" {
+			return "", fmt.Errorf("unknown host %q", host)
+		}
+		return name, nil
+	}
+	if f.hostDown {
+		return "", fmt.Errorf("cannot resolve %s: host b: dial tcp 100.64.0.2:22: connection refused", target)
+	}
+	if _, ok := f.instances[target]; !ok {
+		return "", fmt.Errorf("name %q resolves to 0 hosts; use host/name", target)
+	}
+	return target, nil
+}
+
+func (f *fakeSrv) backendCmd(args []string) ([]byte, error) {
 	missing := func(cmd, name string) error {
 		return cmdErr(args, fmt.Sprintf("%s %s: instance %q does not exist\n", cmd, name, name))
 	}
@@ -166,5 +222,44 @@ func TestSrvInspectAndNotFound(t *testing.T) {
 	})
 	if _, err := other.Inspect(context.Background(), "gha-1"); err == nil || errors.Is(err, errSrvNotFound) {
 		t.Fatalf("Inspect on ssh failure = %v", err)
+	}
+}
+
+func TestSrvBehindFrontend(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeSrv()
+	f.front = true
+	f.instances["gha-1"] = SrvInstance{Name: "gha-1", State: "ready", TailscaleIP: "100.64.0.1"}
+	s := NewSrv("srv", f.run)
+
+	insts, err := s.List(ctx)
+	if err != nil || len(insts) != 1 || insts[0].Name != "gha-1" || insts[0].Host != "a" {
+		t.Fatalf("List = %+v, %v", insts, err)
+	}
+	if host, err := s.Locate(ctx, "gha-1"); err != nil || host != "a" {
+		t.Fatalf("Locate = %q, %v", host, err)
+	}
+	if inst, err := s.Inspect(ctx, Target("gha-1", "a")); err != nil || inst.State != "ready" {
+		t.Fatalf("Inspect a/gha-1 = %+v, %v", inst, err)
+	}
+	// Every host answered and none has it: definite absence.
+	if _, err := s.Inspect(ctx, "gha-2"); !errors.Is(err, errSrvNotFound) {
+		t.Fatalf("Inspect missing bare name = %v", err)
+	}
+	if _, err := s.Inspect(ctx, Target("gha-2", "a")); !errors.Is(err, errSrvNotFound) {
+		t.Fatalf("Inspect missing a/gha-2 = %v", err)
+	}
+
+	// An unreachable host never reads as an empty or smaller inventory, and a
+	// bare name that cannot be resolved is not "does not exist".
+	f.hostDown = true
+	if insts, err := s.List(ctx); err == nil {
+		t.Fatalf("List with a host down = %+v, want error", insts)
+	}
+	if _, err := s.Inspect(ctx, "gha-1"); err == nil || errors.Is(err, errSrvNotFound) {
+		t.Fatalf("Inspect bare name with a host down = %v, want non-not-found error", err)
+	}
+	if inst, err := s.Inspect(ctx, Target("gha-1", "a")); err != nil || inst.Name != "gha-1" {
+		t.Fatalf("Inspect a/gha-1 with b down = %+v, %v", inst, err)
 	}
 }

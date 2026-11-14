@@ -43,6 +43,21 @@ non-interactive SSH to `srv_host` and Tailscale SSH to `root@gha-*` guests,
 plus a writable `~/.ssh/known_hosts`. GARM passes only `GARM_*` variables, so
 the binary sets `PATH` itself when it is empty.
 
+### Behind srv-front
+
+`srv_host` may be a single srv backend or an `srv-front` multi-host frontend;
+the provider tells them apart by the shape of `--json list`. Behind srv-front,
+`new` lets the frontend place the VM, the provider records the chosen host in
+the instance's state record (`host`), and every later `inspect`, `start`,
+`stop` and `delete` addresses `host/name`, so a runner stays manageable while
+another backend is down. Records without a host (runners created before the
+switch) use bare names, which resolve while every backend answers.
+
+An unreachable backend makes `ListInstances` fail instead of returning a
+shorter list, and a bare name is "not found" only when srv-front reports
+`resolves to 0 hosts` after every backend answered; neither case lets GARM
+treat a live runner as gone.
+
 ## Pools
 
 - `flavor`: `<cpus>c-<ram>g-<disk>g`, e.g. `8c-16g-60g` becomes
