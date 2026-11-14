@@ -31,7 +31,7 @@ vendor it.
 
 ```
 Amp ──jobs──> amp orb provider (srv-orbs.service, user srv-orbs)
-                └─ srv-orb-dispatch ──ssh $SRV_HOST orb new/start/stop/delete-proof──> srv
+                └─ srv-orb-dispatch ──ssh $SRV_FRONT_HOST orb new/start/stop/delete-proof──> srv-front ──> srv backend
                                      └─ vsock bootstrap ──> guest: amp orb bootstrap
 guest boot ──> amp-orb-tailscale.service: amp orb id-token → tailscale up (ephemeral, $ORB_TAILSCALE_TAGS, --ssh)
 ```
@@ -48,7 +48,7 @@ guest boot ──> amp-orb-tailscale.service: amp orb id-token → tailscale up 
 | `../common/install-google-chrome.sh` | Run by both image builds; installs Google Chrome stable from Google's Debian repository after checking its SHA256. |
 | `agents/` | `/home/user/.config/agents/` (owned by `user`): pstack's generated skills, its Amp adapter `pstack/amp.md`, and `pstack/sync.ts` to regenerate them. |
 | `install.sh` | `render [DIR]` writes, `install` installs the providers' host files below (and the mobile provider's, see `mobile/README.md`), rendered from `site.env`. Existing env files keep their `AMP_ORB_PROVIDER_TOKEN` line. Nothing is enabled or restarted. |
-| `srv-orbs.env.example` | Template for `/etc/srv-orbs.env` (root, 0600): `SRV_HOST`, `ORB_IMAGE`, the per-orb shape `ORB_CPUS` / `ORB_RAM` / `ORB_DISK` and `ORB_KEEPALIVE_HOURS`. Add `AMP_ORB_PROVIDER_TOKEN` by hand. |
+| `srv-orbs.env.example` | Template for `/etc/srv-orbs.env` (root, 0600): `SRV_FRONT_HOST`, `ORB_IMAGE`, the per-orb shape `ORB_CPUS` / `ORB_RAM` / `ORB_DISK` and `ORB_KEEPALIVE_HOURS`. Add `AMP_ORB_PROVIDER_TOKEN` by hand. |
 | `systemd/srv-orbs.service.d-coredump.conf` | `/etc/systemd/system/srv-orbs.service.d/coredump.conf`. The unit itself is upstream's `contrib/amp/orbs/srv-orbs.service`, which `install.sh` copies from `SRV_SRC_DIR`. |
 | `systemd/srv-orbs.service.d-keepalive.conf` | `/etc/systemd/system/srv-orbs.service.d/keepalive.conf`: dispatch through `srv-orb-keepalive` (see [Keep-alive](#keep-alive)). |
 | `keepalive/srv-orb-keepalive` | `/usr/local/bin/srv-orb-keepalive`, the dispatch program of both providers. |
@@ -87,10 +87,12 @@ sudo systemctl enable --now srv-orb-keepalive-reap@srv-orbs.timer srv-orb-keepal
 
 - **Amp CLI:** installed for user `srv-orbs` (`/var/lib/srv-orbs/.amp`) and
   symlinked as `/usr/local/bin/amp`, so the CLI can update itself.
-- **srv access:** `srv-orbs` reaches srv (`SRV_HOST`) as the host's Tailscale
-  identity. Its `known_hosts` contains srv's host key.
+- **srv access:** `srv-orbs` reaches srv through the multi-host frontend
+  (`SRV_FRONT_HOST`, see the top-level README) as the host's Tailscale
+  identity. Its `known_hosts` contains the frontend's host key (and srv's).
 - **State:** dispatcher state lives in `/var/lib/srv-orbs/dispatch`. Back it up
-  together with srv's state. Never hand-edit it.
+  together with srv's state. Never hand-edit it: each record names its
+  endpoint and backend host, and the dispatcher refuses a changed endpoint.
 
 ## Keep-alive
 

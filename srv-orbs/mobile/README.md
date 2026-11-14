@@ -21,7 +21,7 @@ All settings below are variables in the repo's `site.env` (see
 | `../../srv-mobile-host/` | Host side of the shared iPhone: `pmd3-tunneld` and `iphone-broker`, which the `iphone` CLI (`modules/iphone-client`) calls at `http://$SITE_HOST_TAILNET_IP:$IPHONE_BROKER_PORT` (baked into the image as `IPHONE_BROKER_URL`). See its README. |
 | `expo-ios/` | The `expo-ios` build tool and its overlays and patches. See `expo-ios/README.md`. |
 | `systemd/srv-orbs-mobile.service` (+ `.service.d-coredump.conf`) | The mobile provider: upstream's `srv-orbs.service` with `EnvironmentFile=/etc/srv-orbs-mobile.env`, plus the same coredump drop-in as `../systemd/`. |
-| `srv-orbs-mobile.env.example` | Template for `/etc/srv-orbs-mobile.env` (root, 0600), rendered by `../install.sh` from `SRV_HOST` and `MOBILE_ORB_*`; the provider token is added by hand. Dispatcher state lives in `/var/lib/srv-orbs/dispatch-mobile`, separate from the default provider. |
+| `srv-orbs-mobile.env.example` | Template for `/etc/srv-orbs-mobile.env` (root, 0600), rendered by `../install.sh` from `SRV_FRONT_HOST` and `MOBILE_ORB_*`; the provider token is added by hand. Dispatcher state lives in `/var/lib/srv-orbs/dispatch-mobile`, separate from the default provider. |
 
 Outputs:
 
@@ -155,7 +155,7 @@ kernel without ashmem: `redroid-down --wipe`, then
 ```bash
 sudo ../install.sh install     # units, drop-ins, /etc/srv-orbs{,-mobile}.env from site.env
 # add AMP_ORB_PROVIDER_TOKEN (Amp workspace Settings -> Orbs, the mobile provider) to /etc/srv-orbs-mobile.env
-sudo -u srv-orbs env HOME=/var/lib/srv-orbs SRV_ORB_ENDPOINT="$SRV_HOST" \
+sudo -u srv-orbs env HOME=/var/lib/srv-orbs SRV_ORB_ENDPOINT="$SRV_FRONT_HOST" \
   SRV_ORB_STATE_DIR=/var/lib/srv-orbs/dispatch-mobile /usr/local/bin/srv-orb-dispatch init
 sudo systemctl enable --now srv-orbs-mobile
 ```

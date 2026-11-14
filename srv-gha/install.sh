@@ -12,7 +12,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/../common/site-env.sh"
 site_env_load SITE_HOST_TAILNET_IP GARM_API_PORT BAZEL_REMOTE_GRPC_PORT BAZEL_REMOTE_HTTP_PORT \
-	BAZEL_REMOTE_DIR BAZEL_REMOTE_MAX_SIZE_GIB SRV_HOST GHA_RUNNER_IMAGE
+	BAZEL_REMOTE_DIR BAZEL_REMOTE_MAX_SIZE_GIB SRV_FRONT_HOST GHA_RUNNER_IMAGE
 
 render() { site_env_render "$1" > "$2"; } # render SRC DEST
 

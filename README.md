@@ -90,9 +90,11 @@ it as already applied, or stops because it no longer applies.
 
 `srv-front` runs on `winstons-mac-mini` as the LaunchDaemon `system/srv-front`
 (role account `_srvfront`). It joins the tailnet as its own `tag:srv` node,
-`srv-front`, so `ssh srv-front …` reaches every backend while `ssh srv …` still
-goes straight to this host. Setup follows "Run on macOS" in srv's
-`docs/getting-started/multi-host.md`.
+`srv-front` (`SRV_FRONT_HOST`), and is the control-plane endpoint of both orb
+dispatchers and the GARM provider; `ssh srv …` still goes straight to this
+host's backend. If the frontend is down, running VMs are unaffected, but orb
+spawn/pause/delete and runner creation fail until it is back. Setup follows
+"Run on macOS" in srv's `docs/getting-started/multi-host.md`.
 
 | Piece | Where |
 |---|---|
@@ -101,6 +103,7 @@ goes straight to this host. Setup follows "Run on macOS" in srv's
 | State | `/usr/local/var/srv-front` (tailnet identity and SSH host key; 0700 `_srvfront`) |
 | Log | `/usr/local/var/log/srv-front.log` |
 | Backend trust | `SRV_TRUSTED_FRONTENDS=<frontend stable node ID>` in `/etc/srv/srv.env` on each backend, then restart `srv` |
+| Clients | `srv-orbs` and `garm` pin the frontend's SSH host key in their `~/.ssh/known_hosts` (the dispatcher uses `StrictHostKeyChecking=yes`) |
 
 Build the frontend from **the same srv revision as the backends**: the router
 forwards commands, and a newer frontend sends ones an older backend doesn't
@@ -115,6 +118,18 @@ scp srv-front winston@winstons-mac-mini:
 sudo install -m 0755 ~/srv-front /usr/local/bin/srv-front
 sudo launchctl kickstart -k system/srv-front
 ```
+
+Add a backend (its `hosts` entry and its trust line) only **once it is online
+and on the same srv revision**: while a configured host is unreachable, the
+frontend cannot list all hosts, so new orb spawns ("incomplete backend
+inventory") and GARM's runner listing fail. Orbs and runners already placed on
+a reachable host keep working, because their state records name that host.
+Orbs restored from a project snapshot always land on the snapshot's host.
+
+The orb dispatchers were moved from `srv` to `srv-front` on 2026-11-14: every
+dispatch record and snapshot mapping got `endpoint: srv-front` and
+`host: omarchy-1`. The one-off migration tool, its source and the pre-migration
+state are in `/var/lib/srv-orbs/backup-cutover-20261114152929/`.
 
 ## Backups
 

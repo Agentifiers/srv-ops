@@ -11,7 +11,7 @@ deleted. The VMs are completely separate from the Amp orb setup in
 GitHub ──webhook──> relay (host/relay) /webhooks ──tailnet──> garm (HOST_IP:GARM_API)
                                                │ GARM_COMMAND=CreateInstance
                                                v
-                               garm-provider-srv ──ssh SRV_HOST new gha-… --image GHA_RUNNER_IMAGE
+                               garm-provider-srv ──ssh SRV_FRONT_HOST new gha-… --image GHA_RUNNER_IMAGE (srv-front places it)
                                                │ Tailscale SSH root@gha-…: runner install script
                                                v
                        runner VM (SITE_TAG_GHA) ──> metadata/callback :GARM_API, bazel-remote :GRPC
@@ -27,7 +27,7 @@ Uppercase names refer to `site.env` settings (`GARM_WEBHOOK_BASE_URL`,
 | Site settings | `../site.env` (from `../site.env.example`): `SITE_HOST_TAILNET_IP`, `GARM_API_PORT`, `BAZEL_REMOTE_GRPC_PORT`, `BAZEL_REMOTE_HTTP_PORT`, `SITE_HOST_TS_NAME`, `SITE_TAILNET_DNS` |
 | Renderer | `install.sh render [DIR]` writes the units and GARM config with `@VAR@` placeholders filled from `site.env`; `sudo ./install.sh install` installs them (creates `/etc/garm/config.toml` only if missing) |
 | Runner image builder | `build-image.sh` → `$SRV_IMAGES_DIR/$GHA_RUNNER_IMAGE/` (registered in `/etc/srv/images.json`). Guests get `SRV_GUEST_AUTH_TAGS=$SITE_TAG_GHA` |
-| Provider | `garm-provider-srv/` → `/usr/local/lib/garm/garm-provider-srv`, config `garm/provider-srv.toml` (`srv_host = $SRV_HOST`, `default_image = $GHA_RUNNER_IMAGE`) rendered to `/etc/garm/provider-srv.toml` |
+| Provider | `garm-provider-srv/` → `/usr/local/lib/garm/garm-provider-srv`, config `garm/provider-srv.toml` (`srv_host = $SRV_FRONT_HOST`, `default_image = $GHA_RUNNER_IMAGE`) rendered to `/etc/garm/provider-srv.toml`. `garm`'s `known_hosts` pins the frontend's host key. |
 | GARM v0.2.1 | `/usr/local/bin/garm{,-cli}`, `systemd/garm.service` (user `garm`), `garm/config.toml.example` → rendered to `/etc/garm/config.toml` (fill in the JWT secret and DB passphrase), DB `/var/lib/garm/garm.db` |
 | Webhook ingress | `../host/relay`: a public HTTPS relay that forwards only `/webhooks/*` over Tailscale to GARM (the API and UI are not exposed). GitHub gives up on a delivery after 10 s, and GARM creates runners only from `queued` deliveries; Tailscale Funnel took 7–8 s per delivery and lost jobs, so it is no longer used. |
 | Bazel cache | bazel-remote v2.6.4, `systemd/bazel-remote.service`, btrfs subvolume `$BAZEL_REMOTE_DIR` (excluded from snapper root snapshots, compression off), max `$BAZEL_REMOTE_MAX_SIZE_GIB` GiB, gRPC `$SITE_HOST_TAILNET_IP:$BAZEL_REMOTE_GRPC_PORT`, HTTP `:$BAZEL_REMOTE_HTTP_PORT` |

@@ -31,7 +31,7 @@ disable_jit_config = false
 ## Provider config (`GARM_PROVIDER_CONFIG_FILE`)
 
 ```toml
-srv_host = "srv"                          # ssh destination of srv (SRV_HOST in site.env)
+srv_host = "srv"                          # ssh destination: an srv backend or srv-front (SRV_FRONT_HOST in site.env)
 default_image = "gha-runner"              # srv image when the pool sets none (GHA_RUNNER_IMAGE)
 state_dir = "/var/lib/garm/provider-srv"  # per-instance records, created 0700
 ready_timeout = "5m"                      # bound for srv-ready and for guest SSH
