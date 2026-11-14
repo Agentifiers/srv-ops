@@ -17,7 +17,7 @@ name prefixes, so neither can disturb the other.
 | `srv-orbs/mobile/` | `amp-orb-mobile` and its provider: a `-mobile` guest kernel (binder, ashmem, dma-buf heaps, extra netfilter, PSI) and an image with Android (SDK, redroid, expo-device-hub, agent-device) and iOS (Swift 6.4, xtool, Darwin SDK from your Xcode .xip, pymobiledevice3, `expo-ios`) tooling. Expo/React Native iOS apps build in the orb on Linux. See `srv-orbs/mobile/README.md`. |
 | `srv-mobile-host/` | A USB-attached iPhone shared by mobile orbs: `pmd3-tunneld` and `iphone-broker` (exclusive leases over the tailnet, development signing, install, launch, screenshots, HID input, logs, port forwards). See `srv-mobile-host/README.md`. |
 | `srv-gha/` | Ephemeral GitHub Actions runners: GARM config, the `garm-provider-srv` adapter, the `gha-runner` image builder, and the GARM and bazel-remote units. See `srv-gha/README.md`. |
-| `host/` | srv's `images.json`, an `srv.env` template, local srv patches and host sysctl settings. |
+| `host/` | srv's `images.json`, an `srv.env` template, local srv patches, host sysctl settings, the public relay (`host/relay`) and the CLIProxyAPI model proxy on winstons-mac-mini, including clearing rate-limit cooldowns after a usage reset. See `host/cliproxyapi/README.md`. |
 
 ## Configure
 

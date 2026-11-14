@@ -1,10 +1,11 @@
 # Public HTTPS relay (Coolify "cliproxy-relay" service on a public server).
 # Coolify's proxy terminates TLS for the service's domains and forwards to
-# Caddy on :8080; Caddy reaches this host over Tailscale through the sidecar's
-# SOCKS5 proxy (its HTTP proxy mangles requests).
-#   /webhooks/*  -> GARM            @SITE_HOST_TAILNET_IP@:@GARM_API_PORT@
-#   everything   -> CLIProxyAPI     @SITE_HOST_TAILNET_IP@:8318 (`tailscale serve --tcp 8318 tcp://127.0.0.1:8317`)
-# Render: . common/site-env.sh; site_env_load SITE_HOST_TAILNET_IP GARM_API_PORT; site_env_render host/relay/compose.yaml.example
+# Caddy on :8080; Caddy reaches the tailnet through the sidecar's SOCKS5 proxy
+# (its HTTP proxy mangles requests).
+#   /webhooks/*  -> GARM            @SITE_HOST_TAILNET_IP@:@GARM_API_PORT@ (this host)
+#   everything   -> CLIProxyAPI     @CLIPROXY_TAILNET_IP@:8318 (the proxy host's
+#                   `tailscale serve --tcp 8318 tcp://127.0.0.1:<CLIProxyAPI port>`)
+# Render: . common/site-env.sh; site_env_load SITE_HOST_TAILNET_IP GARM_API_PORT CLIPROXY_TAILNET_IP; site_env_render host/relay/compose.yaml.example
 # TS_AUTHKEY is a Coolify service variable (a single-use tag:srv key).
 services:
   cliproxy-ts:
@@ -56,7 +57,7 @@ configs:
           respond "relay ok proto={http.request.header.X-Forwarded-Proto} host={host}" 200
         }
         handle {
-          reverse_proxy http://@SITE_HOST_TAILNET_IP@:8318 {
+          reverse_proxy http://@CLIPROXY_TAILNET_IP@:8318 {
             flush_interval -1
             header_down X-Relay-Upstream tailnet
             transport http {
