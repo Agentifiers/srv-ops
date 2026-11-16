@@ -18,8 +18,12 @@ site_env_load SITE_HOST_TAILNET_IP BAZEL_REMOTE_GRPC_PORT SRV_IMAGES_DIR GHA_RUN
 BASE_DIR="${BASE_DIR:-$SRV_IMAGES_DIR/arch-base}"
 OUTPUT_DIR="${OUTPUT_DIR:-$SRV_IMAGES_DIR/$GHA_RUNNER_IMAGE}"
 ROOTFS_SIZE="${ROOTFS_SIZE:-}"
-# Node versions pre-seeded into the runner's tool cache (comma or space separated).
+# Node and Python versions pre-seeded into the runner's tool cache (exact
+# X.Y.Z, comma or space separated).
 read -r -a NODE_VERSIONS <<<"${GHA_NODE_VERSIONS//,/ }"
+read -r -a PYTHON_VERSIONS <<<"${GHA_PYTHON_VERSIONS//,/ }"
+# python-build-standalone release the Python builds come from.
+PYTHON_STANDALONE_RELEASE=20261110
 
 RUNNER_VERSION=2.338.1
 # From the release body ("BEGIN SHA linux-x64") and the asset digest of
@@ -30,11 +34,11 @@ RUNNER_UID=1001
 BAZEL_PREWARM_VERSION=9.3.1
 BAZEL_REMOTE_GRPC="grpc://$SITE_HOST_TAILNET_IP:$BAZEL_REMOTE_GRPC_PORT"
 
-# arch-base already ships docker, git, go, jq, curl and gcc. icu, krb5,
-# openssl and zlib cover what the runner's Debian-only installdependencies.sh
-# would install.
+# arch-base already ships docker, git, go, jq, curl and gcc. docker-buildx is
+# the plugin docker/setup-buildx-action requires. icu, krb5, openssl and zlib
+# cover what the runner's Debian-only installdependencies.sh would install.
 PACKAGES=(
-	base-devel sudo github-cli unzip zip wget openssh inetutils
+	base-devel sudo github-cli unzip zip wget openssh inetutils docker-buildx
 	bazelisk aws-cli-v2 nodejs npm python
 	python-pipx python-pyflakes shellcheck
 	icu krb5 openssl zlib
@@ -50,6 +54,7 @@ mkdir -p "$OUTPUT_DIR"
 img="$OUTPUT_DIR/rootfs-base.img.new"
 tarball="$OUTPUT_DIR/actions-runner.tar.gz.new"
 node_dl="$OUTPUT_DIR/node-dist.new"
+python_dl="$OUTPUT_DIR/python-dist.new"
 mnt="$(mktemp -d)"
 udev_rule=/run/udev/rules.d/99-srv-image-no-automount.rules
 
@@ -63,7 +68,7 @@ cleanup() {
 		umount -R "$mnt" || { echo "failed to unmount $mnt; leaving it in place" >&2; exit 1; }
 	fi
 	rmdir "$mnt"
-	rm -rf "$udev_rule" "$tarball" "$node_dl"
+	rm -rf "$udev_rule" "$tarball" "$node_dl" "$python_dl"
 	udevadm control --reload
 	[[ $status == 0 ]] || rm -f "$img" "$OUTPUT_DIR/manifest.txt.new"
 	exit "$status"
@@ -85,6 +90,24 @@ for v in "${NODE_VERSIONS[@]}"; do
 	curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 "https://nodejs.org/dist/v$v/$f" -o "$node_dl/$f"
 	curl -fsSL --retry 3 --connect-timeout 20 --max-time 60 "https://nodejs.org/dist/v$v/SHASUMS256.txt" -o "$node_dl/SHASUMS256-$v.txt"
 	(cd "$node_dl" && grep -E "^[0-9a-f]{64}  $f\$" "SHASUMS256-$v.txt" | sha256sum -c --quiet --strict -) \
+		|| { echo "sha256 mismatch for $f" >&2; exit 1; }
+done
+
+# actions/setup-python downloads only builds for Ubuntu, macOS and Windows: on
+# Arch it finds no match and fails unless the tool cache already holds the
+# version. python-build-standalone builds are relocatable and self-contained;
+# each is verified against its release's SHA256SUMS.
+mkdir -p "$python_dl"
+python_base="https://github.com/astral-sh/python-build-standalone/releases/download/$PYTHON_STANDALONE_RELEASE"
+if ((${#PYTHON_VERSIONS[@]})); then
+	curl -fsSL --retry 3 --connect-timeout 20 --max-time 60 "$python_base/SHA256SUMS" -o "$python_dl/SHA256SUMS"
+fi
+for v in "${PYTHON_VERSIONS[@]}"; do
+	[[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "GHA_PYTHON_VERSIONS: '$v' is not an exact version" >&2; exit 1; }
+	f="cpython-$v+$PYTHON_STANDALONE_RELEASE-x86_64-unknown-linux-gnu-install_only.tar.gz"
+	curl -fsSL --retry 3 --connect-timeout 20 --max-time 600 "$python_base/$f" -o "$python_dl/$f" \
+		|| { echo "no $f in python-build-standalone $PYTHON_STANDALONE_RELEASE" >&2; exit 1; }
+	(cd "$python_dl" && awk -v f="$f" '$2 == f' SHA256SUMS | grep -E "^[0-9a-f]{64}  " | sha256sum -c --quiet --strict -) \
 		|| { echo "sha256 mismatch for $f" >&2; exit 1; }
 done
 
@@ -134,14 +157,21 @@ tar -xzf "$tarball" -C "$mnt/home/runner/actions-runner"
 chown -R "$RUNNER_UID:$RUNNER_UID" "$mnt/home/runner/actions-runner"
 
 # @actions/tool-cache layout under the runner's default work folder:
-# _work/_tool/node/<version>/x64/ plus the x64.complete marker.
+# _work/_tool/<tool>/<version>/x64/ plus the x64.complete marker. The tool
+# names are the ones setup-node and setup-python look up.
 toolcache="$mnt/home/runner/actions-runner/_work/_tool"
 for v in "${NODE_VERSIONS[@]}"; do
 	install -d "$toolcache/node/$v/x64"
 	tar -xJf "$node_dl/node-v$v-linux-x64.tar.xz" -C "$toolcache/node/$v/x64" --strip-components=1 --no-same-owner
 	touch "$toolcache/node/$v/x64.complete"
 done
-if ((${#NODE_VERSIONS[@]})); then
+for v in "${PYTHON_VERSIONS[@]}"; do
+	install -d "$toolcache/Python/$v/x64"
+	tar -xzf "$python_dl/cpython-$v+$PYTHON_STANDALONE_RELEASE-x86_64-unknown-linux-gnu-install_only.tar.gz" \
+		-C "$toolcache/Python/$v/x64" --strip-components=1 --no-same-owner
+	touch "$toolcache/Python/$v/x64.complete"
+done
+if ((${#NODE_VERSIONS[@]} + ${#PYTHON_VERSIONS[@]})); then
 	chown -R "$RUNNER_UID:$RUNNER_UID" "$mnt/home/runner/actions-runner/_work"
 fi
 
@@ -178,6 +208,8 @@ fi
 	echo "gh=$(arch-chroot "$mnt" gh --version | head -1)"
 	echo "node=$(arch-chroot "$mnt" node --version)"
 	echo "node_toolcache=${NODE_VERSIONS[*]:-none}"
+	echo "python_toolcache=${PYTHON_VERSIONS[*]:-none} (python-build-standalone $PYTHON_STANDALONE_RELEASE)"
+	echo "buildx=$(arch-chroot "$mnt" docker buildx version)"
 	echo "aws=$(arch-chroot "$mnt" aws --version)"
 	echo "chrome=$chrome_version"
 	echo "packages=$(IFS=,; echo "${PACKAGES[*]}")"

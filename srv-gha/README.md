@@ -126,7 +126,7 @@ garm-cli pool update <id> --max-runners 4 --min-idle-runners 0 --flavor 6c-12g-3
 garm-cli runner list
 ```
 
-Workflows target `runs-on: [self-hosted, linux, bazel]`.
+Workflows target `runs-on: [self-hosted, srv]`.
 
 ## Browsers
 
@@ -135,20 +135,39 @@ manifest), Arch's `chromium` with `chromedriver`, and `xvfb-run` for headed
 tests. `../common/install-google-chrome.sh` installs Chrome from Google's
 Debian repository, checking the .deb against the repository's SHA256.
 Puppeteer and Playwright download their own browsers unless pointed at
-`/usr/bin/google-chrome` or `/usr/bin/chromium`.
+`/usr/bin/google-chrome` or `/usr/bin/chromium`. Drop `--with-deps` from
+`playwright install`: it installs libraries with `apt-get`, which Arch lacks,
+and the image already has them.
 
-## Node tool cache
+## Docker and arm64 images
+
+Docker runs with the `docker-buildx` plugin, which `docker/setup-buildx-action`
+requires. The guest kernel has `binfmt_misc`, so `docker/setup-qemu-action`
+registers QEMU and Buildx builds `linux/arm64` images on the x64 runners. The
+Deployments platform's arm64 release images build here in about 2 minutes
+under emulation; GitHub's arm64 runner took about 4½.
+
+## Tool cache
 
 `build-image.sh` pre-seeds the runner's tool cache
-(`/home/runner/actions-runner/_work/_tool/node/<version>/x64`) with each exact
-version in `GHA_NODE_VERSIONS`, from nodejs.org's official tarballs checked
-against its `SHASUMS256.txt`. `actions/setup-node` then finds the requested
-version locally and skips the download. Each runner VM starts from a clean
-image, so without this every job downloads Node from GitHub's CDN, and a stalled
-download can hang the step until the job times out: `@actions/http-client`
-half-closes a timed-out socket and the process waits on it. Keep the list in
-step with the repos' `.node-version` files and rebuild the image after a bump;
-an unlisted version still works, it just downloads again.
+(`/home/runner/actions-runner/_work/_tool/<tool>/<version>/x64`):
+
+- **Node:** each exact version in `GHA_NODE_VERSIONS`, from nodejs.org's
+  official tarballs checked against its `SHASUMS256.txt`. `actions/setup-node`
+  then finds the requested version locally and skips the download. Each runner
+  VM starts from a clean image, so without this every job downloads Node from
+  GitHub's CDN, and a stalled download can hang the step until the job times
+  out: `@actions/http-client` half-closes a timed-out socket and the process
+  waits on it. Keep the list in step with the repos' `.node-version` files and
+  rebuild the image after a bump; an unlisted version still works, it just
+  downloads again.
+- **Python:** each exact version in `GHA_PYTHON_VERSIONS`, from
+  [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+  (release `PYTHON_STANDALONE_RELEASE` in `build-image.sh`) checked against the
+  release's `SHA256SUMS`. `actions/setup-python` only downloads builds for
+  Ubuntu, macOS and Windows, so on these runners a `python-version` the cache
+  doesn't hold fails the step. Add the version a workflow requests (any
+  `3.12.x` satisfies `python-version: "3.12"`) and rebuild the image.
 
 ## Bazel remote cache
 
@@ -198,9 +217,10 @@ sudo ./build-image.sh   # reads ../site.env; reflink layer on arch-base; bump th
 ```
 
 Rebuild after rebuilding `arch-base`, whenever GitHub starts requiring a
-newer runner, or after changing `GHA_NODE_VERSIONS`. Running VMs keep their
-rootfs, but with ephemeral runners every new job gets the new image. Recycle
-idle runners after a rebuild with `garm-cli runner rm <name>`.
+newer runner, or after changing `GHA_NODE_VERSIONS` or `GHA_PYTHON_VERSIONS`.
+Running VMs keep their rootfs, but with ephemeral runners every new job gets
+the new image. Recycle idle runners after a rebuild with
+`garm-cli runner rm <name>`.
 
 ## srv
 
