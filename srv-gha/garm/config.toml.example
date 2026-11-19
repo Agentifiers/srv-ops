@@ -16,7 +16,8 @@ secret = "<64 random chars>"
 time_to_live = "8760h"
 
 [apiserver]
-  bind = "@SITE_HOST_TAILNET_IP@"
+  # Loopback only: `tailscale serve --tcp @GARM_API_PORT@` puts it on the tailnet.
+  bind = "127.0.0.1"
   port = @GARM_API_PORT@
   use_tls = false
   cors_origins = ["*"]
@@ -31,7 +32,7 @@ time_to_live = "8760h"
   backend = "sqlite3"
   passphrase = "<32 random chars>"
   [database.sqlite3]
-    db_file = "/var/lib/garm/garm.db"
+    db_file = "/usr/local/var/garm/garm.db"
     busy_timeout_seconds = 5
 
 [[provider]]
@@ -40,5 +41,5 @@ description = "Firecracker microVMs via srv"
 provider_type = "external"
 disable_jit_config = false
   [provider.external]
-  config_file = "/etc/garm/provider-srv.toml"
+  config_file = "/usr/local/etc/garm/provider-srv.toml"
   provider_executable = "/usr/local/lib/garm/garm-provider-srv"

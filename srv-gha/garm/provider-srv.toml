@@ -1,4 +1,4 @@
 srv_host = "@SRV_FRONT_HOST@"
 default_image = "@GHA_RUNNER_IMAGE@"
-state_dir = "/var/lib/garm/provider-srv"
+state_dir = "/usr/local/var/garm/provider-srv"
 ready_timeout = "5m"

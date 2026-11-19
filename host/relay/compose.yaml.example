@@ -2,10 +2,11 @@
 # Coolify's proxy terminates TLS for the service's domains and forwards to
 # Caddy on :8080; Caddy reaches the tailnet through the sidecar's SOCKS5 proxy
 # (its HTTP proxy mangles requests).
-#   /webhooks/*  -> GARM            @SITE_HOST_TAILNET_IP@:@GARM_API_PORT@ (this host)
+#   /webhooks/*  -> GARM            @GARM_TAILNET_IP@:@GARM_API_PORT@ (winstons-mac-mini's
+#                   `tailscale serve --tcp @GARM_API_PORT@ tcp://127.0.0.1:@GARM_API_PORT@`)
 #   everything   -> CLIProxyAPI     @CLIPROXY_TAILNET_IP@:8318 (the proxy host's
 #                   `tailscale serve --tcp 8318 tcp://127.0.0.1:<CLIProxyAPI port>`)
-# Render: . common/site-env.sh; site_env_load SITE_HOST_TAILNET_IP GARM_API_PORT CLIPROXY_TAILNET_IP; site_env_render host/relay/compose.yaml.example
+# Render: . common/site-env.sh; site_env_load GARM_TAILNET_IP GARM_API_PORT CLIPROXY_TAILNET_IP; site_env_render host/relay/compose.yaml.example
 # TS_AUTHKEY is a Coolify service variable (a single-use tag:srv key).
 services:
   cliproxy-ts:
@@ -45,7 +46,7 @@ configs:
       }
       :8080 {
         handle /webhooks/* {
-          reverse_proxy http://@SITE_HOST_TAILNET_IP@:@GARM_API_PORT@ {
+          reverse_proxy http://@GARM_TAILNET_IP@:@GARM_API_PORT@ {
             header_down X-Relay-Upstream tailnet
             transport http {
               forward_proxy_url socks5://cliproxy-ts:1055

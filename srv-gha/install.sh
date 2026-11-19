@@ -2,9 +2,11 @@
 # Renders srv-gha's host templates from the repo's site.env:
 #
 #   ./install.sh render [DIR]   write rendered files to DIR (default ./rendered)
-#   sudo ./install.sh install   install the systemd units and the provider
-#                               config; /etc/garm/config.toml is only created
-#                               when missing (fill in its secrets afterwards)
+#   sudo ./install.sh install   install bazel-remote's systemd unit (srv host)
+#
+# GARM runs on winstons-mac-mini: copy the rendered config.toml.example (as
+# config.toml, secrets filled in), provider-srv.toml and garm.plist next to
+# the binaries and run install-garm-macos.sh there (README "GARM on the Mac").
 #
 # Templates use @VAR@ placeholders for settings from site.env.
 set -euo pipefail
@@ -19,9 +21,9 @@ render() { site_env_render "$1" > "$2"; } # render SRC DEST
 render_all() { # render_all DIR
 	mkdir -p "$1"
 	render "$HERE/systemd/bazel-remote.service" "$1/bazel-remote.service"
-	render "$HERE/systemd/garm.service" "$1/garm.service"
 	render "$HERE/garm/config.toml.example" "$1/config.toml.example"
 	render "$HERE/garm/provider-srv.toml" "$1/provider-srv.toml"
+	cp "$HERE/launchd/garm.plist" "$1/garm.plist"
 }
 
 case "${1:-}" in
@@ -34,15 +36,9 @@ install)
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' EXIT
 	render_all "$tmp"
-	install -m 0644 "$tmp/bazel-remote.service" "$tmp/garm.service" /etc/systemd/system/
-	install -d /etc/garm
-	install -m 0640 -o root -g garm "$tmp/provider-srv.toml" /etc/garm/provider-srv.toml
-	if [[ ! -e /etc/garm/config.toml ]]; then
-		install -m 0640 -o root -g garm "$tmp/config.toml.example" /etc/garm/config.toml
-		echo "created /etc/garm/config.toml; set jwt_auth.secret and database.passphrase"
-	fi
+	install -m 0644 "$tmp/bazel-remote.service" /etc/systemd/system/
 	systemctl daemon-reload
-	echo "installed; restart garm/bazel-remote to apply"
+	echo "installed; restart bazel-remote to apply"
 	;;
 *)
 	echo "usage: $0 render [DIR] | install" >&2

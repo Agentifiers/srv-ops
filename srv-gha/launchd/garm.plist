@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- GARM on winstons-mac-mini (role account _garm); installed by srv-gha/install-garm-macos.sh. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>garm</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/garm</string>
+		<string>-config</string>
+		<string>/usr/local/etc/garm/config.toml</string>
+	</array>
+	<key>UserName</key>
+	<string>_garm</string>
+	<key>GroupName</key>
+	<string>_garm</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/usr/local/var/garm</string>
+		<key>PATH</key>
+		<string>/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>/usr/local/var/garm</string>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<key>StandardOutPath</key>
+	<string>/usr/local/var/log/garm.log</string>
+	<key>StandardErrorPath</key>
+	<string>/usr/local/var/log/garm.log</string>
+</dict>
+</plist>

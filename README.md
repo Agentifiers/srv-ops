@@ -16,7 +16,7 @@ name prefixes, so neither can disturb the other.
 | `srv-orbs/` | Amp orbs using srv's upstream `srv-orb-dispatch` and native orb image, plus a thin image layer that puts every orb on your tailnet (Amp workload identity → Tailscale OIDC) and adds common tooling. See `srv-orbs/README.md`. |
 | `srv-orbs/mobile/` | `amp-orb-mobile` and its provider: a `-mobile` guest kernel (binder, ashmem, dma-buf heaps, extra netfilter, PSI) and an image with Android (SDK, redroid, expo-device-hub, agent-device) and iOS (Swift 6.4, xtool, Darwin SDK from your Xcode .xip, pymobiledevice3, `expo-ios`) tooling. Expo/React Native iOS apps build in the orb on Linux. See `srv-orbs/mobile/README.md`. |
 | `srv-mobile-host/` | A USB-attached iPhone shared by mobile orbs: `pmd3-tunneld` and `iphone-broker` (exclusive leases over the tailnet, development signing, install, launch, screenshots, HID input, logs, port forwards). See `srv-mobile-host/README.md`. |
-| `srv-gha/` | Ephemeral GitHub Actions runners: GARM config, the `garm-provider-srv` adapter, the `gha-runner` image builder, and the GARM and bazel-remote units. See `srv-gha/README.md`. |
+| `srv-gha/` | Ephemeral GitHub Actions runners: GARM config and launchd install for winstons-mac-mini, the `garm-provider-srv` adapter, the `gha-runner` image builder, and the bazel-remote unit. See `srv-gha/README.md`. |
 | `host/` | srv's `images.json`, an `srv.env` template, local srv patches, host sysctl settings, the public relay (`host/relay`) and the CLIProxyAPI model proxy on winstons-mac-mini, including clearing rate-limit cooldowns after a usage reset. See `host/cliproxyapi/README.md`. |
 
 ## Configure
@@ -94,7 +94,21 @@ it as already applied, or stops because it no longer applies.
 dispatchers and the GARM provider; `ssh srv …` still goes straight to this
 host's backend. If the frontend is down, running VMs are unaffected, but orb
 spawn/pause/delete and runner creation fail until it is back. Setup follows
-"Run on macOS" in srv's `docs/getting-started/multi-host.md`.
+"Run on macOS" in srv's `docs/getting-started/multi-host.md`. winstons-mac-mini
+also runs GARM (LaunchDaemon `system/garm`, role account `_garm`; see
+`srv-gha/README.md`, "GARM on the Mac").
+
+Backends (`hosts` entries in `srv-front.json`):
+
+| Host | srv node | Runs |
+|---|---|---|
+| `omarchy-1` | `srv` (`SRV_HOST`) | srv plus everything else in this repo except GARM: orb dispatchers, bazel-remote, iphone-broker |
+| `omarchy-2` | `srv-2` | srv only; same `/etc/srv/srv.env` except `SRV_HOSTNAME=srv-2`, and a copy of omarchy-1's `/var/lib/srv/images` and `/etc/srv/images.json`. Guests reach omarchy-1's services over the tailnet. |
+
+After rebuilding an image on omarchy-1, copy it to omarchy-2 as well
+(`rsync -aH --sparse --rsync-path='sudo rsync' /var/lib/srv/images/<name>/ omarchy-2:/var/lib/srv/images/<name>/`).
+Placement only picks hosts that have the requested image. Both hosts must run
+the same srv revision.
 
 | Piece | Where |
 |---|---|
@@ -134,17 +148,18 @@ state are in `/var/lib/srv-orbs/backup-cutover-20261114152929/`.
 ## Backups
 
 Back these up together: `/var/lib/srv/state`, `/srv/jail/.start-receipts`,
-`/etc/srv`, `/var/lib/srv-orbs/dispatch*`, `/var/lib/garm` and
-`/var/lib/iphone-broker` (lease state, broker-installed apps, signing key and
-certificate).
+`/etc/srv`, `/var/lib/srv-orbs/dispatch*` and `/var/lib/iphone-broker` (lease
+state, broker-installed apps, signing key and certificate) on omarchy-1, and
+`/usr/local/var/garm` and `/usr/local/etc/garm` on winstons-mac-mini.
 
 ## Secrets
 
-Where they live on the host (never in this repo):
+Where they live (never in this repo):
 
 - `/etc/srv/srv.env`: Tailscale OAuth client and auth key.
 - `/etc/srv-orbs*.env`: Amp orb provider tokens.
-- `/etc/garm/config.toml`: JWT secret and DB passphrase.
+- `/usr/local/etc/garm/config.toml` on winstons-mac-mini: GARM's JWT secret and
+  DB passphrase.
 - GARM admin login, bazel-remote credentials and GitHub App private keys:
   root- or admin-only files you choose (see `srv-gha/README.md`).
 - `/etc/srv-mobile/asc.env` and the `.p8` it names: App Store Connect API key,
