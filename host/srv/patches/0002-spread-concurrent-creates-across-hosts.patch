@@ -1,0 +1,164 @@
+From af31edb0ce9ad7fb024ca63134ff04535fb171ff Mon Sep 17 00:00:00 2001
+From: Ben Kraus <ben@agentifiers.com>
+Date: Fri, 20 Nov 2026 23:01:03 -0700
+Subject: [PATCH] Spread concurrent creates across srv-front hosts
+
+A backend creates one instance at a time: cmdNew holds App.mu through
+provisioner.Create, boot included (about 9.6 s for a 24 GiB CI runner).
+It also reserves memory only once a create starts. A burst of concurrent
+creates therefore all saw the same host with the most memory left and
+queued there one after another while the other host sat idle.
+
+- choose prefers the eligible host with the fewest creates this frontend
+  has in flight, then the most memory and disk left, and holds a claim on
+  the chosen host until the create returns, whether it succeeded or not.
+- list/status/node build their query router from Hosts, Transport and
+  Timeout instead of copying the Router, which now holds a mutex.
+
+With no creates in flight, placement is unchanged.
+---
+ internal/front/front.go      | 40 +++++++++++++++++++++++++++++++-----
+ internal/front/front_test.go | 38 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/internal/front/front.go b/internal/front/front.go
+index 90b038f..3056e34 100644
+--- a/internal/front/front.go
++++ b/internal/front/front.go
+@@ -49,6 +49,11 @@ type Router struct {
+ 	Hosts     []Host
+ 	Transport Transport
+ 	Timeout   time.Duration
++
++	// creating counts, per host name, the creates choose placed there that
++	// have not returned yet.
++	createMu sync.Mutex
++	creating map[string]int
+ }
+ type Result struct {
+ 	Host  string          `json:"host"`
+@@ -145,7 +150,12 @@ type placement struct {
+ 	Disk     int64  `json:"disk_left_bytes"`
+ }
+ 
+-func (r *Router) choose(ctx context.Context, a model.Actor, args []string) (Host, error) {
++// choose places a create on the eligible host with the fewest creates this
++// frontend has in flight there, then the most memory and disk left. A backend
++// runs one create at a time and reserves its memory only once it starts, so
++// placing by memory alone queues a burst of concurrent creates on one host.
++// The returned func ends the create's claim on its host.
++func (r *Router) choose(ctx context.Context, a model.Actor, args []string) (Host, func(), error) {
+ 	type candidate struct {
+ 		h Host
+ 		p placement
+@@ -168,8 +178,13 @@ func (r *Router) choose(ctx context.Context, a model.Actor, args []string) (Host
+ 			failures = append(failures, v.Host+": "+p.Reason)
+ 		}
+ 	}
++	r.createMu.Lock()
++	defer r.createMu.Unlock()
+ 	sort.Slice(candidates, func(i, j int) bool {
+ 		x, y := candidates[i], candidates[j]
++		if cx, cy := r.creating[x.h.Name], r.creating[y.h.Name]; cx != cy {
++			return cx < cy
++		}
+ 		if x.p.Memory != y.p.Memory {
+ 			return x.p.Memory > y.p.Memory
+ 		}
+@@ -179,9 +194,21 @@ func (r *Router) choose(ctx context.Context, a model.Actor, args []string) (Host
+ 		return x.h.Name < y.h.Name
+ 	})
+ 	if len(candidates) == 0 {
+-		return Host{}, fmt.Errorf("%w: %s", errNoEligibleHost, strings.Join(failures, "; "))
++		return Host{}, nil, fmt.Errorf("%w: %s", errNoEligibleHost, strings.Join(failures, "; "))
++	}
++	h := candidates[0].h
++	if r.creating == nil {
++		r.creating = make(map[string]int)
+ 	}
+-	return candidates[0].h, nil
++	r.creating[h.Name]++
++	return h, func() {
++		r.createMu.Lock()
++		defer r.createMu.Unlock()
++		r.creating[h.Name]--
++		if r.creating[h.Name] == 0 {
++			delete(r.creating, h.Name)
++		}
++	}, nil
+ }
+ 
+ // Run accepts argv, not shell text. --host is a frontend-only option.
+@@ -265,7 +292,7 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
+ 		if orb {
+ 			queryArgs = append([]string{"--json", "orb"}, args...)
+ 		}
+-		queryRouter := *r
++		queryRouter := &Router{Hosts: r.Hosts, Transport: r.Transport, Timeout: r.Timeout}
+ 		if cmd == "node" {
+ 			if len(args) != 2 || args[1] != "list" {
+ 				return fmt.Errorf("usage: node list [--host HOST] [--json]")
+@@ -325,7 +352,10 @@ Use direct backend SSH for top/PTY and migration recovery mutations.
+ 				return fmt.Errorf("conflicting host")
+ 			}
+ 		} else if hostName == "" {
+-			h, err = r.choose(ctx, a, args[1:])
++			var release func()
++			if h, release, err = r.choose(ctx, a, args[1:]); err == nil {
++				defer release()
++			}
+ 		}
+ 	case "inspect", "start", "stop", "restart", "delete", "resize", "upgrade", "fsck", "restore", "backup", "disk", "logs", "export", "bootstrap", "wazuh":
+ 		if cmd == "delete" && len(args) > 2 && args[2] == "--expect" && hostName == "" {
+diff --git a/internal/front/front_test.go b/internal/front/front_test.go
+index 24835d7..56503e3 100644
+--- a/internal/front/front_test.go
++++ b/internal/front/front_test.go
+@@ -108,6 +108,44 @@ func TestPlacementEligibilityAndNoRetry(t *testing.T) {
+ 		t.Fatalf("placement refusal exit = %d, err=%v", front.ExitStatus(err), err)
+ 	}
+ }
++func TestPlacementSpreadsConcurrentCreates(t *testing.T) {
++	started := make(chan string)
++	finish := make(chan struct{})
++	r := router(func(h front.Host, args []string, _ io.Reader, out io.Writer) error {
++		if args[0] == "--json" {
++			memory := map[string]int{"a": 2000, "b": 1000}[h.Name]
++			fmt.Fprintf(out, `{"eligible":true,"memory_left_mib":%d,"disk_left_bytes":10}`, memory)
++			return nil
++		}
++		started <- h.Name
++		<-finish
++		return errors.New("connection lost after submission")
++	})
++	errs := make(chan error, 3)
++	create := func() {
++		_, _, err := run(r, "new", "vm")
++		errs <- err
++	}
++	// Each create blocks on its backend, as srv's do while one boots.
++	var hosts []string
++	for range 3 {
++		go create()
++		hosts = append(hosts, <-started)
++	}
++	if want := []string{"a", "b", "a"}; !reflect.DeepEqual(hosts, want) {
++		t.Fatalf("concurrent creates placed on %v, want %v", hosts, want)
++	}
++	close(finish)
++	for range 3 {
++		<-errs
++	}
++	// Failed creates release their hosts too: placement is back to memory.
++	go create()
++	if h := <-started; h != "a" {
++		t.Fatalf("create after the others returned placed on %s, want a", h)
++	}
++	<-errs
++}
+ func TestMigrationCompletionOrdering(t *testing.T) {
+ 	for _, policy := range [][]string{nil, {"--fixed-memory"}, {"--pool", "destination"}} {
+ 		for _, failure := range []string{"send-base", "receive-base", "send-disk", "receive-disk", "metadata", "import", "complete", "wrong-token", "success"} {
+-- 
+2.50.1 (Apple Git-155)
+

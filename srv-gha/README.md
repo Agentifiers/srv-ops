@@ -168,9 +168,10 @@ adding them to the App installation.
 Each org or repo gets one pool, for example:
 
 - Flavor `6c-24g-30g` (24 GiB RAM since 2026-11-18), image `$GHA_RUNNER_IMAGE`.
-- Max runners 1000 (all four pools since 2026-11-18), no warm idle runner
-  (`--min-idle-runners 0`): a runner VM starts when a job is queued, so each
-  job waits for one VM boot.
+- Max runners 1000 (all four pools since 2026-11-18).
+- Warm idle runners: Graftyard keeps 8 (`--min-idle-runners 8` since
+  2026-11-20, 192 GiB held while idle); the other pools keep none, so each of
+  their jobs waits for a VM boot.
 - Labels `self-hosted, linux, x64, bazel, srv`.
 
 GARM caps each pool separately and has no "unlimited" value (0 blocks every
@@ -179,9 +180,9 @@ budget, enforced at admission on each backend (omarchy-1 and omarchy-2 behind
 srv-front, about 503 GiB each, so roughly 20 concurrent 24 GiB runners per
 host minus what orbs reserve). Two risks remain: CI can fill both hosts'
 budgets so orb spawns fail, and once busy runners outnumber a host's 28
-physical cores, CPU-bound steps slow down markedly (~2× was measured). A warm
-idle runner (`--min-idle-runners 1`) saves the boot but keeps its memory
-reserved even when no jobs are running.
+physical cores, CPU-bound steps slow down markedly (~2× was measured). Each
+warm idle runner saves a job the boot but keeps its 24 GiB reserved while no
+jobs run.
 
 The image mounts `/` with `barrier=0`: runner disks are discarded after each
 job, and with barriers every guest fsync cost ~17 ms of host flushing.
@@ -193,6 +194,27 @@ garm-cli runner list
 ```
 
 Workflows target `runs-on: [self-hosted, srv]`.
+
+### Job start latency
+
+A job that no idle runner takes waits for GARM, then for a VM:
+
+- **GARM backoff.** GARM ignores a queued job for the controller's
+  `minimum_job_age_backoff` so an idle runner can take it first, then checks
+  every 5 s. The default 30 s only delays jobs when no idle runner is free;
+  it is 5 s since 2026-11-20 (`garm-cli controller update
+  --minimum-job-age-backoff 5`). Don't set 0 while a pool keeps idle runners:
+  GARM then often creates a second runner for a job an idle runner already
+  took, and that VM boots ahead of ones jobs need.
+- **One create at a time per backend.** srv holds its control-plane lock for
+  the whole `srv new`, boot included, so each backend brings up one runner
+  about every 9.6 s. Memory is reserved only once a create starts, so an
+  unpatched srv-front sends a burst of concurrent creates to the host with the
+  most memory left, and the whole burst queues there.
+  `../host/srv/patches/0002-spread-concurrent-creates-across-hosts.patch`
+  places each create on the host with the fewest creates in flight.
+- **Guest bootstrap.** The provider waits for srv's `ready`, then for
+  Tailscale SSH, then starts the runner install script.
 
 ## Browsers
 
@@ -288,8 +310,9 @@ sudo ./build-image.sh   # reads ../site.env; reflink layer on arch-base; bump th
 Rebuild after rebuilding `arch-base`, whenever GitHub starts requiring a
 newer runner, or after changing `GHA_NODE_VERSIONS` or `GHA_PYTHON_VERSIONS`.
 Running VMs keep their rootfs, but with ephemeral runners every new job gets
-the new image. Recycle idle runners after a rebuild with
-`garm-cli runner rm <name>`.
+the new image, except jobs taken by idle runners booted before the rebuild
+(Graftyard keeps 8). Recycle idle runners after a rebuild with
+`garm-cli runner rm <name>`; GARM boots replacements from the new image.
 
 ## srv
 
