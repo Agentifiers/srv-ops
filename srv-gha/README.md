@@ -169,9 +169,11 @@ Each org or repo gets one pool, for example:
 
 - Flavor `6c-24g-30g` (24 GiB RAM since 2026-11-18), image `$GHA_RUNNER_IMAGE`.
 - Max runners 1000 (all four pools since 2026-11-18).
-- Warm idle runners: Graftyard keeps 8 (`--min-idle-runners 8` since
-  2026-11-20, 192 GiB held while idle); the other pools keep none, so each of
-  their jobs waits for a VM boot.
+- Warm idle runners: the Agentifiers org pool keeps 8 (`--min-idle-runners 8`
+  since 2026-11-21, 192 GiB held while idle). It runs `Agentifiers/graftyard`'s
+  CI; org runners only take jobs from their own org's repos, so the `Graftyard`
+  org's pool is not the one for it. The other pools keep none, so each of their
+  jobs waits for a VM boot.
 - Labels `self-hosted, linux, x64, bazel, srv`.
 
 GARM caps each pool separately and has no "unlimited" value (0 blocks every
@@ -311,7 +313,7 @@ Rebuild after rebuilding `arch-base`, whenever GitHub starts requiring a
 newer runner, or after changing `GHA_NODE_VERSIONS` or `GHA_PYTHON_VERSIONS`.
 Running VMs keep their rootfs, but with ephemeral runners every new job gets
 the new image, except jobs taken by idle runners booted before the rebuild
-(Graftyard keeps 8). Recycle idle runners after a rebuild with
+(the Agentifiers pool keeps 8). Recycle idle runners after a rebuild with
 `garm-cli runner rm <name>`; GARM boots replacements from the new image.
 
 ## srv
